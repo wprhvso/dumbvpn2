@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common");
 const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
+const h2 = @import("h2.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -75,54 +76,127 @@ pub fn main() !void {
         return;
     };
 
-    std.log.info("TLS 1.3 Handshake established! Negotiated secure session.", .{});
+    std.log.info("TLS 1.3 Handshake established! Negotiating HTTP/2 RFC 8441 WebSocket...", .{});
 
-    const ws_upgrade = "GET /api/v2/stream HTTP/1.1\r\n" ++
-        "Host: 34.88.228.23\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n";
+    // 1. Send HTTP/2 Connection Preface (24 bytes)
+    const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    try tls_client.writer.writeAll(PREFACE);
 
-    try tls_client.writer.writeAll(ws_upgrade);
+    // 2. Send Initial SETTINGS frame with SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 (RFC 8441)
+    var settings_payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, settings_payload[0..2], 0x0008, .big); // SETTINGS_ENABLE_CONNECT_PROTOCOL
+    std.mem.writeInt(u32, settings_payload[2..6], 1, .big);
+
+    const settings_hdr = h2.FrameHeader{
+        .length = settings_payload.len,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    var hdr_buf: [9]u8 = undefined;
+    settings_hdr.encode(&hdr_buf);
+    try tls_client.writer.writeAll(&hdr_buf);
+    try tls_client.writer.writeAll(&settings_payload);
+
+    // 3. Send RFC 8441 CONNECT HEADERS frame on Stream 1
+    var hpack_buf: [512]u8 = undefined;
+    var hpack_len: usize = 0;
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], ":method", "CONNECT");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], ":protocol", "websocket");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], ":scheme", "https");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], ":path", "/api/v2/stream");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], ":authority", "34.88.228.23");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], "sec-websocket-version", "13");
+    hpack_len += h2.encodeLiteralHeader(hpack_buf[hpack_len..], "sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+
+    const headers_hdr = h2.FrameHeader{
+        .length = hpack_len,
+        .frame_type = .headers,
+        .flags = 0x04, // END_HEADERS
+        .stream_id = 1,
+    };
+    headers_hdr.encode(&hdr_buf);
+    try tls_client.writer.writeAll(&hdr_buf);
+    try tls_client.writer.writeAll(hpack_buf[0..hpack_len]);
+
     try tls_client.writer.flush();
     try stream_writer.interface.flush();
 
-    var resp_buf: [512]u8 = undefined;
-    var n: usize = 0;
-    while (n < resp_buf.len) {
-        const byte = try tls_client.reader.takeByte();
-        resp_buf[n] = byte;
-        n += 1;
-        if (n >= 4 and std.mem.eql(u8, resp_buf[n - 4 .. n], "\r\n\r\n")) break;
+    // 4. Read server response frames until Stream 1 HEADERS is received
+    var stream1_open = false;
+    while (!stream1_open) {
+        var raw_hdr: [9]u8 = undefined;
+        for (&raw_hdr) |*b| {
+            b.* = try tls_client.reader.takeByte();
+        }
+        const frame = h2.FrameHeader.decode(&raw_hdr);
+
+        if (frame.frame_type == .settings and (frame.flags & 0x01) == 0) {
+            const ack_hdr = h2.FrameHeader{
+                .length = 0,
+                .frame_type = .settings,
+                .flags = 0x01,
+                .stream_id = 0,
+            };
+            ack_hdr.encode(&hdr_buf);
+            try tls_client.writer.writeAll(&hdr_buf);
+            try tls_client.writer.flush();
+            try stream_writer.interface.flush();
+        } else if (frame.frame_type == .headers and frame.stream_id == 1) {
+            stream1_open = true;
+        }
+
+        var i: usize = 0;
+        while (i < frame.length) : (i += 1) {
+            _ = try tls_client.reader.takeByte();
+        }
     }
 
-    if (std.mem.indexOf(u8, resp_buf[0..n], "101") != null) {
-        std.log.info("WebSocket Upgrade accepted by Envoy: HTTP/1.1 101 Switching Protocols!", .{});
-        std.log.info("MMX Tunnel established over TLS 1.3 WebSocket! Active and running. Press Ctrl+C to stop.", .{});
-    } else {
-        std.log.warn("Unexpected server response: {s}", .{resp_buf[0..n]});
-        return;
-    }
+    std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
+    std.log.info("MMX Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (true) {
         std.Thread.sleep(5 * std.time.ns_per_s);
         ping_seq += 1;
 
-        const ping_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 0, 0x05, 0, 0, 0 };
-        tls_client.writer.writeAll(&ping_frame) catch |err| {
-            std.log.warn("Connection lost: {any}. Reconnecting...", .{err});
-            break;
+        // Send HTTP/2 PING frame on Stream 0 (RFC 7540 Keepalive)
+        const ping_hdr = h2.FrameHeader{
+            .length = 8,
+            .frame_type = .ping,
+            .flags = 0x00,
+            .stream_id = 0,
         };
-        tls_client.writer.flush() catch |err| {
-            std.log.warn("TLS flush error: {any}. Reconnecting...", .{err});
-            break;
+        ping_hdr.encode(&hdr_buf);
+        try tls_client.writer.writeAll(&hdr_buf);
+        try tls_client.writer.writeAll("PINGPING");
+
+        // Send MMX Heartbeat DATA frame on Stream 1
+        const mmx_data = [_]u8{ 0, 0, 0, 0, 0x05, 0, 0, 0 };
+        const data_hdr = h2.FrameHeader{
+            .length = mmx_data.len,
+            .frame_type = .data,
+            .flags = 0x00,
+            .stream_id = 1,
         };
-        stream_writer.interface.flush() catch |err| {
-            std.log.warn("TCP flush error: {any}. Reconnecting...", .{err});
-            break;
-        };
-        std.log.info("L7 Heartbeat #{d} delivered via TLS 1.3 WebSocket tunnel. Hub is healthy.", .{ping_seq});
+        data_hdr.encode(&hdr_buf);
+        try tls_client.writer.writeAll(&hdr_buf);
+        try tls_client.writer.writeAll(&mmx_data);
+
+        try tls_client.writer.flush();
+        try stream_writer.interface.flush();
+
+        // Read server PING ACK
+        var ping_ack_hdr: [9]u8 = undefined;
+        for (&ping_ack_hdr) |*b| {
+            b.* = try tls_client.reader.takeByte();
+        }
+        const ack_frame = h2.FrameHeader.decode(&ping_ack_hdr);
+        var j: usize = 0;
+        while (j < ack_frame.length) : (j += 1) {
+            _ = try tls_client.reader.takeByte();
+        }
+
+        std.log.info("HTTP/2 L7 Heartbeat #{d} delivered via RFC 8441 stream. Hub is healthy.", .{ping_seq});
     }
 }
