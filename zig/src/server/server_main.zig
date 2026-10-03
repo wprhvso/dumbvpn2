@@ -5,56 +5,85 @@ const embedded_ui = @import("embedded_ui.zig");
 const common = @import("common");
 const protocol = common.protocol;
 
-fn handleConnection(conn: std.net.Server.Connection) void {
+fn pump(src: std.net.Stream, dst: std.net.Stream) void {
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const len = src.read(&buf) catch break;
+        if (len == 0) break;
+        dst.writeAll(buf[0..len]) catch break;
+    }
+}
+
+fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
 
     var buf: [4096]u8 = undefined;
-    while (true) {
-        const read_len = conn.stream.read(&buf) catch break;
-        if (read_len == 0) break;
-        const data = buf[0..read_len];
+    const read_len = conn.stream.read(&buf) catch return;
+    if (read_len == 0) return;
+    const data = buf[0..read_len];
 
-        if (std.mem.startsWith(u8, data, "GET /api/v1/health")) {
-            const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
-            _ = conn.stream.writeAll(resp) catch {};
-            break;
-        } else if (std.mem.startsWith(u8, data, "GET / HTTP/1.1") or std.mem.startsWith(u8, data, "GET /index.html")) {
-            const html = embedded_ui.index_html;
-            var header_buf: [256]u8 = undefined;
-            const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{html.len}) catch break;
-            _ = conn.stream.writeAll(header) catch {};
-            _ = conn.stream.writeAll(html) catch {};
-            break;
-        } else if (std.mem.startsWith(u8, data, "GET /assets/index.js")) {
-            const js = embedded_ui.index_js;
-            var header_buf: [256]u8 = undefined;
-            const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{js.len}) catch break;
-            _ = conn.stream.writeAll(header) catch {};
-            _ = conn.stream.writeAll(js) catch {};
-            break;
-        } else if (std.mem.indexOf(u8, data, "Upgrade: websocket") != null or std.mem.startsWith(u8, data, "GET /api/v2/stream")) {
-            const resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
-            _ = conn.stream.writeAll(resp) catch break;
+    if (std.mem.startsWith(u8, data, "GET /api/v1/health")) {
+        const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+        _ = conn.stream.writeAll(resp) catch {};
+        return;
+    } else if (std.mem.startsWith(u8, data, "GET / HTTP/1.1") or std.mem.startsWith(u8, data, "GET /index.html")) {
+        const html = embedded_ui.index_html;
+        var header_buf: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{html.len}) catch return;
+        _ = conn.stream.writeAll(header) catch {};
+        _ = conn.stream.writeAll(html) catch {};
+        return;
+    } else if (std.mem.startsWith(u8, data, "GET /assets/index.js")) {
+        const js = embedded_ui.index_js;
+        var header_buf: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{js.len}) catch return;
+        _ = conn.stream.writeAll(header) catch {};
+        _ = conn.stream.writeAll(js) catch {};
+        return;
+    } else if (std.mem.indexOf(u8, data, "Upgrade: websocket") != null or std.mem.startsWith(u8, data, "GET /api/v2/stream")) {
+        const resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+        _ = conn.stream.writeAll(resp) catch return;
 
-            while (true) {
-                const ws_read_len = conn.stream.read(&buf) catch break;
-                if (ws_read_len == 0) break;
-                const pong_frame = [_]u8{ 0x82, 0x08, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00 };
-                _ = conn.stream.writeAll(&pong_frame) catch break;
-            }
-            break;
-        } else if (data.len >= 8) {
-            const hdr = protocol.Header.decode(data[0..8]);
-            if (hdr.frame_type == .ping) {
-                const pong_hdr = protocol.Header{
-                    .stream_id = hdr.stream_id,
-                    .frame_type = .pong,
-                    .flags = 0,
-                    .length = 0,
-                };
-                var pong_buf: [8]u8 = undefined;
-                pong_hdr.encode(&pong_buf);
-                _ = conn.stream.writeAll(&pong_buf) catch break;
+        var stream_buf: [4096]u8 = undefined;
+        while (true) {
+            const n = conn.stream.read(&stream_buf) catch break;
+            if (n == 0) break;
+            const payload = stream_buf[0..n];
+
+            if (payload.len >= 8) {
+                const hdr = protocol.Header.decode(payload[0..8]);
+                if (hdr.frame_type == .ping) {
+                    const pong_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 0, 0x06, 0, 0, 0 };
+                    _ = conn.stream.writeAll(&pong_frame) catch break;
+                } else if (hdr.frame_type == .connect and payload.len >= 12) {
+                    const addr_type = payload[8];
+                    var target_port: u16 = 80;
+                    var target_host: []const u8 = "";
+
+                    if (addr_type == 0x02) {
+                        const domain_len = payload[9];
+                        if (payload.len >= 10 + domain_len + 2) {
+                            target_host = payload[10 .. 10 + domain_len];
+                            target_port = std.mem.readInt(u16, payload[10 + domain_len ..][0..2], .big);
+                        }
+                    }
+
+                    if (target_host.len > 0) {
+                        std.log.info("Proxying CONNECT to {s}:{d}...", .{ target_host, target_port });
+                        const target_stream = std.net.tcpConnectToHost(allocator, target_host, target_port) catch |err| {
+                            std.log.warn("Failed to connect to target {s}:{d}: {any}", .{ target_host, target_port, err });
+                            break;
+                        };
+                        defer target_stream.close();
+
+                        _ = conn.stream.writeAll(&[_]u8{ 0x82, 0x08, 0, 0, 0, 1, 0x01, 0, 0, 0 }) catch break;
+
+                        const t1 = std.Thread.spawn(.{}, pump, .{ conn.stream, target_stream }) catch break;
+                        t1.detach();
+                        pump(target_stream, conn.stream);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -94,7 +123,7 @@ pub fn main() !void {
             break;
         };
 
-        const thread = std.Thread.spawn(.{}, handleConnection, .{conn}) catch {
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ allocator, conn }) catch {
             conn.stream.close();
             continue;
         };
