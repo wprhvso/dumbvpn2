@@ -9,3 +9,4 @@ pub const icmp_engine = @import("tun/icmp_engine.zig");
 pub const ip_checksum = @import("tun/ip_checksum.zig");
 pub const device = @import("tun/device.zig");
 pub const tun_linux = @import("tun/tun_linux.zig");
+pub const dns_responder = @import("tun/dns_responder.zig");

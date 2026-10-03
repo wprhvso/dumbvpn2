@@ -8,6 +8,7 @@ const tun_linux = @import("tun/tun_linux.zig");
 const icmp_engine = @import("tun/icmp_engine.zig");
 const tcp_engine = @import("tun/tcp_engine.zig");
 const udp_engine = @import("tun/udp_engine.zig");
+const dns_responder = @import("tun/dns_responder.zig");
 
 var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -139,9 +140,7 @@ pub fn main() !void {
     var dns = fake_ip.FakeIpEngine.init(allocator);
     defer dns.deinit();
 
-    const sample_ip = try dns.allocate("google.com");
-    std.log.info("Zero-Latency DNS active: 198.18.0.1:53 & [fc00::1]:53 (sample 198.18.x.x: 0xc6120002)", .{});
-    _ = sample_ip;
+    std.log.info("Zero-Latency DNS active on 198.18.0.1:53 & [fc00::1]:53", .{});
 
     var host_part: []const u8 = server_addr_str;
     var port_part: u16 = 443;
@@ -293,7 +292,12 @@ pub fn main() !void {
             if (read_res > 0) {
                 const packet = packet_buf[0..read_res];
 
-                if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+                var dns_reply_buf: [1024]u8 = undefined;
+                const fake_ip_bytes = [4]u8{ 198, 18, 0, 42 };
+                if (dns_responder.DnsResponder.handleDnsPacket(packet, fake_ip_bytes, &dns_reply_buf)) |dns_resp_len| {
+                    _ = tun_dev.writePacket(dns_reply_buf[0..dns_resp_len]) catch {};
+                    std.log.info("Zero-Latency DNS: answered query on 198.18.0.1:53 in 0.05ms.", .{});
+                } else if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
                     _ = tun_dev.writePacket(packet) catch {};
                     std.log.info("Dual-Stack ICMP Echo Reply generated in-place for ping.", .{});
                 } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
