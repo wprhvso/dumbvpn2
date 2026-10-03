@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const common = @import("common");
 const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
@@ -7,6 +8,59 @@ const tun_linux = @import("tun/tun_linux.zig");
 const icmp_engine = @import("tun/icmp_engine.zig");
 const tcp_engine = @import("tun/tcp_engine.zig");
 const udp_engine = @import("tun/udp_engine.zig");
+
+var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn handleSig(sig: i32) callconv(.c) void {
+    _ = sig;
+    should_exit.store(true, .seq_cst);
+}
+
+const ResolvGuard = struct {
+    has_backup: bool = false,
+
+    pub fn capture(self: *ResolvGuard) void {
+        _ = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{ "cp", "-a", "/etc/resolv.conf", "/etc/resolv.conf.mesh.bak" },
+        }) catch return;
+        self.has_backup = true;
+
+        _ = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{ "chattr", "-i", "/etc/resolv.conf" },
+        }) catch {};
+
+        const new_resolv = "nameserver 198.18.0.1\nnameserver 127.0.0.1\noptions edns0\n";
+        const file = std.fs.createFileAbsolute("/etc/resolv.conf", .{}) catch return;
+        file.writeAll(new_resolv) catch return;
+        file.close();
+
+        _ = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{ "chattr", "+i", "/etc/resolv.conf" },
+        }) catch {};
+
+        std.log.info("DNS captured: /etc/resolv.conf updated to 198.18.0.1 and write-protected (+i).", .{});
+    }
+
+    pub fn restore(self: *ResolvGuard) void {
+        if (!self.has_backup) return;
+
+        _ = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{ "chattr", "-i", "/etc/resolv.conf" },
+        }) catch {};
+
+        _ = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{ "mv", "-f", "/etc/resolv.conf.mesh.bak", "/etc/resolv.conf" },
+        }) catch {};
+
+        self.has_backup = false;
+        std.log.info("DNS restored: /etc/resolv.conf restored to original state.", .{});
+    }
+};
 
 fn setupRoutes() void {
     _ = std.process.Child.run(.{
@@ -45,10 +99,25 @@ fn setupRoutes() void {
     }) catch {};
 }
 
+fn teardownRoutes() void {
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "link", "del", "mesh0" },
+    }) catch {};
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    const act = posix.Sigaction{
+        .handler = .{ .handler = handleSig },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.TERM, &act, null);
 
     var server_addr_str: []const u8 = "34.88.228.23:443";
 
@@ -192,14 +261,19 @@ pub fn main() !void {
 
     std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
 
+    var resolv_guard = ResolvGuard{};
+    defer resolv_guard.restore();
+
     const maybe_tun = tun_linux.openTun("mesh0") catch |err| blk: {
         std.log.warn("Could not open /dev/net/tun: {any}. Run with sudo for full system TUN.", .{err});
         break :blk null;
     };
     defer if (maybe_tun) |t| t.close();
+    defer teardownRoutes();
 
     if (maybe_tun != null) {
         setupRoutes();
+        resolv_guard.capture();
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16 & IPv6 fd88::2/64.", .{});
         std.log.info("Routes active: 198.18.0.0/15 (Fake-IPv4), fc00::/7 (Fake-IPv6), fd88::/64 (Mesh).", .{});
     }
@@ -207,8 +281,10 @@ pub fn main() !void {
     std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
-    while (true) {
+    while (!should_exit.load(.seq_cst)) {
         std.Thread.sleep(5 * std.time.ns_per_s);
+        if (should_exit.load(.seq_cst)) break;
+
         ping_seq += 1;
 
         if (maybe_tun) |tun_dev| {
@@ -236,8 +312,8 @@ pub fn main() !void {
             .stream_id = 0,
         };
         ping_hdr.encode(&hdr_buf);
-        try tls_client.writer.writeAll(&hdr_buf);
-        try tls_client.writer.writeAll("PINGPING");
+        tls_client.writer.writeAll(&hdr_buf) catch break;
+        tls_client.writer.writeAll("PINGPING") catch break;
 
         const mmx_data = [_]u8{ 0, 0, 0, 0, 0x05, 0, 0, 0 };
         const data_hdr = h2.FrameHeader{
@@ -247,22 +323,24 @@ pub fn main() !void {
             .stream_id = 1,
         };
         data_hdr.encode(&hdr_buf);
-        try tls_client.writer.writeAll(&hdr_buf);
-        try tls_client.writer.writeAll(&mmx_data);
+        tls_client.writer.writeAll(&hdr_buf) catch break;
+        tls_client.writer.writeAll(&mmx_data) catch break;
 
-        try tls_client.writer.flush();
-        try stream_writer.interface.flush();
+        tls_client.writer.flush() catch break;
+        stream_writer.interface.flush() catch break;
 
         var ping_ack_hdr: [9]u8 = undefined;
         for (&ping_ack_hdr) |*b| {
-            b.* = try tls_client.reader.takeByte();
+            b.* = tls_client.reader.takeByte() catch break;
         }
         const ack_frame = h2.FrameHeader.decode(&ping_ack_hdr);
         var j: usize = 0;
         while (j < ack_frame.length) : (j += 1) {
-            _ = try tls_client.reader.takeByte();
+            _ = tls_client.reader.takeByte() catch break;
         }
 
         std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq});
     }
+
+    std.log.info("Shutting down cleanly: restoring DNS and network interfaces...", .{});
 }
