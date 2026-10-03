@@ -32,7 +32,7 @@ pub fn main() !void {
     std.log.info("Zero-Latency DNS active: 198.18.0.1:53 (sample 198.18.x.x allocated for google.com: 0x{x})", .{sample_ip});
 
     var host_part: []const u8 = server_addr_str;
-    var port_part: u16 = 4000;
+    var port_part: u16 = 443;
     if (std.mem.indexOfScalar(u8, server_addr_str, ':')) |colon_idx| {
         host_part = server_addr_str[0..colon_idx];
         port_part = try std.fmt.parseInt(u16, server_addr_str[colon_idx + 1 ..], 10);
@@ -44,41 +44,64 @@ pub fn main() !void {
         return;
     };
 
-    const stream = std.net.tcpConnectToAddress(target_addr) catch |err| {
+    const tcp_stream = std.net.tcpConnectToAddress(target_addr) catch |err| {
         std.log.warn("Could not connect to {s}:{d} ({any}). Ensure server is deployed and port is open.", .{ host_part, port_part, err });
         return;
     };
-    defer stream.close();
+    defer tcp_stream.close();
 
-    std.log.info("Successfully established L4 connection to hub {s}:{d}!", .{ host_part, port_part });
+    std.log.info("Established L4 TCP socket to {s}:{d}. Starting TLS 1.3 Handshake...", .{ host_part, port_part });
 
-    var header_buf: [8]u8 = undefined;
-    const hdr = protocol.Header{
-        .stream_id = 1,
-        .frame_type = .connect,
-        .flags = 0,
-        .length = 0,
+    const min_len = std.crypto.tls.Client.min_buffer_len;
+    var socket_read_buffer: [min_len]u8 = undefined;
+    var socket_write_buffer: [min_len]u8 = undefined;
+    var tls_read_buffer: [min_len + 4096]u8 = undefined;
+
+    var stream_reader = tcp_stream.reader(&socket_read_buffer);
+    var stream_writer = tcp_stream.writer(&socket_write_buffer);
+
+    var tls_client = std.crypto.tls.Client.init(
+        stream_reader.interface(),
+        &stream_writer.interface,
+        .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &tls_read_buffer,
+            .write_buffer = &socket_write_buffer,
+        },
+    ) catch |err| {
+        std.log.err("TLS 1.3 Handshake failed: {any}", .{err});
+        return;
     };
-    hdr.encode(&header_buf);
-    try stream.writeAll(&header_buf);
-    std.log.info("Sent MMX Handshake frame. Tunnel established and active! Press Ctrl+C to stop.", .{});
+
+    std.log.info("TLS 1.3 Handshake established! Connected over encrypted channel.", .{});
+
+    const ws_upgrade = "GET /api/v2/stream HTTP/1.1\r\n" ++
+        "Host: 34.88.228.23\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    try tls_client.writer.writeAll(ws_upgrade);
+    try tls_client.writer.flush();
+
+    std.log.info("Sent WebSocket Upgrade request over TLS 1.3. Tunnel active! Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (true) {
         std.Thread.sleep(5 * std.time.ns_per_s);
         ping_seq += 1;
 
-        const ping_hdr = protocol.Header{
-            .stream_id = 0,
-            .frame_type = .ping,
-            .flags = 0,
-            .length = 0,
-        };
-        ping_hdr.encode(&header_buf);
-        stream.writeAll(&header_buf) catch |err| {
+        const ping_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 0, 0x05, 0, 0, 0 };
+        tls_client.writer.writeAll(&ping_frame) catch |err| {
             std.log.warn("Connection lost: {any}. Reconnecting...", .{err});
             break;
         };
-        std.log.info("L7 Ping #{d} sent to hub. Tunnel healthy.", .{ping_seq});
+        tls_client.writer.flush() catch |err| {
+            std.log.warn("Connection flush error: {any}. Reconnecting...", .{err});
+            break;
+        };
+        std.log.info("L7 Heartbeat #{d} sent to hub via TLS 1.3. Tunnel healthy.", .{ping_seq});
     }
 }
