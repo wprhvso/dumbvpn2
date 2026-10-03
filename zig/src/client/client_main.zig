@@ -4,7 +4,6 @@ const common = @import("common");
 const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
 const h2 = @import("h2.zig");
-const ws = common.ws;
 const tun_linux = @import("tun/tun_linux.zig");
 const icmp_engine = @import("tun/icmp_engine.zig");
 const tcp_engine = @import("tun/tcp_engine.zig");
@@ -148,41 +147,113 @@ fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
     }
 }
 
-fn forwardTcpStream(
-    tun_dev: @import("tun/device.zig").TunDevice,
-    fake_ip_bytes: [4]u8,
-    client_ip_bytes: [4]u8,
-    target_port: u16,
+pub const TcpSession = struct {
+    client_ip: [4]u8,
+    fake_ip: [4]u8,
     client_port: u16,
+    target_port: u16,
+    hub_tcp: std.net.Stream,
+    tls_client: std.crypto.tls.Client,
+    s_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    s_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    t_read_buf: [std.crypto.tls.Client.min_buffer_len + 4096]u8 = undefined,
+    t_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    server_seq: u32 = 0x10000001,
+    client_ack: u32 = 0,
+    active: bool = true,
+};
+
+var session_map: std.AutoHashMap(u16, *TcpSession) = undefined;
+var map_mutex: std.Thread.Mutex = .{};
+
+fn runSessionReader(session: *TcpSession, tun_dev: @import("tun/device.zig").TunDevice) void {
+    var resp_buf: [16384]u8 = undefined;
+    var tcp_pkt_buf: [16384 + 128]u8 = undefined;
+
+    while (session.active and !should_exit.load(.seq_cst)) {
+        const n = session.tls_client.reader.readSliceShort(&resp_buf) catch break;
+        if (n == 0) break;
+
+        var raw_data = resp_buf[0..n];
+        if (raw_data.len >= 2 and raw_data[0] == 0x82) {
+            var offset: usize = 2;
+            if (raw_data[1] == 126) {
+                offset = 4;
+            } else if (raw_data[1] == 127) {
+                offset = 10;
+            }
+            if (raw_data.len >= offset) {
+                raw_data = raw_data[offset..];
+            }
+        }
+        if (raw_data.len == 0) continue;
+
+        const pkt_len = tcp_engine.buildTcpPacket(
+            session.fake_ip,
+            session.client_ip,
+            session.target_port,
+            session.client_port,
+            session.server_seq,
+            session.client_ack,
+            0x18,
+            raw_data,
+            &tcp_pkt_buf,
+        ) orelse break;
+
+        _ = tun_dev.writePacket(tcp_pkt_buf[0..pkt_len]) catch break;
+        session.server_seq += @intCast(raw_data.len);
+    }
+
+    session.active = false;
+    map_mutex.lock();
+    _ = session_map.remove(session.client_port);
+    map_mutex.unlock();
+}
+
+fn openFlowSession(
+    allocator: std.mem.Allocator,
+    tun_dev: @import("tun/device.zig").TunDevice,
+    client_ip: [4]u8,
+    fake_ip_bytes: [4]u8,
+    client_port: u16,
+    target_port: u16,
     domain: []const u8,
-    initial_payload: []const u8,
-    client_ack_seq: u32,
     hub_host: []const u8,
     hub_port: u16,
-) void {
-    const hub_addr = std.net.Address.parseIp4(hub_host, hub_port) catch return;
-    const hub_tcp = std.net.tcpConnectToAddress(hub_addr) catch return;
-    defer hub_tcp.close();
+) ?*TcpSession {
+    const hub_addr = std.net.Address.parseIp4(hub_host, hub_port) catch return null;
+    const tcp = std.net.tcpConnectToAddress(hub_addr) catch return null;
 
-    const min_len = std.crypto.tls.Client.min_buffer_len;
-    var s_read_buf: [min_len]u8 = undefined;
-    var s_write_buf: [min_len]u8 = undefined;
-    var t_read_buf: [min_len + 4096]u8 = undefined;
-    var t_write_buf: [min_len]u8 = undefined;
+    const session = allocator.create(TcpSession) catch {
+        tcp.close();
+        return null;
+    };
+    session.* = .{
+        .client_ip = client_ip,
+        .fake_ip = fake_ip_bytes,
+        .client_port = client_port,
+        .target_port = target_port,
+        .hub_tcp = tcp,
+        .tls_client = undefined,
+    };
 
-    var s_reader = hub_tcp.reader(&s_read_buf);
-    var s_writer = hub_tcp.writer(&s_write_buf);
+    var s_reader = session.hub_tcp.reader(&session.s_read_buf);
+    var s_writer = session.hub_tcp.writer(&session.s_write_buf);
 
-    var tls = std.crypto.tls.Client.init(
+    session.tls_client = std.crypto.tls.Client.init(
         s_reader.interface(),
         &s_writer.interface,
         .{
             .host = .no_verification,
             .ca = .no_verification,
-            .read_buffer = &t_read_buf,
-            .write_buffer = &t_write_buf,
+            .read_buffer = &session.t_read_buf,
+            .write_buffer = &session.t_write_buf,
         },
-    ) catch return;
+    ) catch {
+        allocator.destroy(session);
+        tcp.close();
+        return null;
+    };
 
     const ws_upgrade = "GET /api/v2/stream HTTP/1.1\r\n" ++
         "Host: 34.88.228.23\r\n" ++
@@ -191,14 +262,14 @@ fn forwardTcpStream(
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
 
-    tls.writer.writeAll(ws_upgrade) catch return;
-    tls.writer.flush() catch return;
-    s_writer.interface.flush() catch return;
+    session.tls_client.writer.writeAll(ws_upgrade) catch return null;
+    session.tls_client.writer.flush() catch return null;
+    s_writer.interface.flush() catch return null;
 
     var resp_buf: [512]u8 = undefined;
     var head_len: usize = 0;
     while (head_len < resp_buf.len) {
-        const byte = tls.reader.takeByte() catch break;
+        const byte = session.tls_client.reader.takeByte() catch break;
         resp_buf[head_len] = byte;
         head_len += 1;
         if (head_len >= 4 and std.mem.eql(u8, resp_buf[head_len - 4 .. head_len], "\r\n\r\n")) break;
@@ -215,55 +286,31 @@ fn forwardTcpStream(
     @memcpy(connect_frame[10 .. 10 + domain.len], domain);
     std.mem.writeInt(u16, connect_frame[10 + domain.len ..][0..2], target_port, .big);
 
-    var ws_frame_buf: [1024]u8 = undefined;
-    const ws_c_len = ws.wrapWsBinaryMasked(connect_frame[0 .. 8 + payload_len], &ws_frame_buf);
-    tls.writer.writeAll(ws_frame_buf[0..ws_c_len]) catch return;
-    tls.writer.flush() catch return;
-    s_writer.interface.flush() catch return;
+    session.tls_client.writer.writeAll(connect_frame[0 .. 8 + payload_len]) catch return null;
+    session.tls_client.writer.flush() catch return null;
+    s_writer.interface.flush() catch return null;
 
-    var ack_frame: [64]u8 = undefined;
-    _ = tls.reader.readSliceShort(&ack_frame) catch {};
-
-    var ws_payload_buf: [4096]u8 = undefined;
-    const ws_p_len = ws.wrapWsBinaryMasked(initial_payload, &ws_payload_buf);
-    tls.writer.writeAll(ws_payload_buf[0..ws_p_len]) catch return;
-    tls.writer.flush() catch return;
-    s_writer.interface.flush() catch return;
-
-    var server_seq: u32 = 0x10000001;
-    var target_resp_buf: [16384]u8 = undefined;
-    var tcp_pkt_buf: [16384 + 128]u8 = undefined;
-
-    while (!should_exit.load(.seq_cst)) {
-        const n = tls.reader.readSliceShort(&target_resp_buf) catch break;
-        if (n == 0) break;
-
-        var clean_data: []const u8 = target_resp_buf[0..n];
-        if (ws.unwrapWs(target_resp_buf[0..n])) |unwrapped| {
-            clean_data = unwrapped;
-        }
-
-        if (clean_data.len == 0) continue;
-        if (clean_data.len == 8 and clean_data[4] == 0x01) continue;
-
-        const pkt_len = tcp_engine.buildTcpPacket(
-            fake_ip_bytes,
-            client_ip_bytes,
-            target_port,
-            client_port,
-            server_seq,
-            client_ack_seq,
-            0x18,
-            clean_data,
-            &tcp_pkt_buf,
-        ) orelse break;
-
-        _ = tun_dev.writePacket(tcp_pkt_buf[0..pkt_len]) catch break;
-        server_seq += @intCast(clean_data.len);
+    var ack_buf: [10]u8 = undefined;
+    for (&ack_buf) |*b| {
+        b.* = session.tls_client.reader.takeByte() catch break;
     }
+
+    map_mutex.lock();
+    session_map.put(client_port, session) catch {};
+    map_mutex.unlock();
+
+    const reader_thread = std.Thread.spawn(.{}, runSessionReader, .{ session, tun_dev }) catch null;
+    if (reader_thread) |t| t.detach();
+
+    return session;
 }
 
-fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice, hub_host: []const u8, hub_port: u16) void {
+fn runTunPump(
+    allocator: std.mem.Allocator,
+    tun_dev: @import("tun/device.zig").TunDevice,
+    hub_host: []const u8,
+    hub_port: u16,
+) void {
     var packet_buf: [2048]u8 = undefined;
     while (!should_exit.load(.seq_cst)) {
         const read_res = tun_dev.readPacket(&packet_buf) catch continue;
@@ -273,59 +320,75 @@ fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice, hub_host: []const u8
             if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
                 _ = tun_dev.writePacket(packet) catch {};
             } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
+                const client_ip = packet[12..16];
+                const target_ip = packet[16..20];
+                const target_u32 = std.mem.readInt(u32, target_ip, .big);
+
+                var domain: []const u8 = "icanhazip.com";
+                if (global_dns) |d| {
+                    if (d.lookup(target_u32)) |name| {
+                        domain = name;
+                    }
+                }
+
                 if (tcp_res.is_syn) {
                     _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                    std.log.info("User-Space TCP: SYN-ACK handshake generated for port {d}.", .{tcp_res.dst_port});
-                } else if (tcp_res.payload.len > 0) {
-                    var ack_buf: [128]u8 = undefined;
-                    const client_ip = packet[12..16];
-                    const target_ip = packet[16..20];
-                    const ack_len = tcp_engine.buildTcpPacket(
-                        target_ip.*,
-                        client_ip.*,
-                        tcp_res.dst_port,
-                        tcp_res.src_port,
-                        0x10000001,
-                        tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len)),
-                        0x10,
-                        &.{},
-                        &ack_buf,
-                    );
-                    if (ack_len) |l| {
-                        _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
-                    }
+                    std.log.info("User-Space TCP: SYN-ACK generated for {s}:{d} (flow port {d}).", .{ domain, tcp_res.dst_port, tcp_res.src_port });
 
-                    const target_u32 = std.mem.readInt(u32, target_ip, .big);
-                    var domain: []const u8 = "icanhazip.com";
-                    if (global_dns) |d| {
-                        if (d.lookup(target_u32)) |name| {
-                            domain = name;
-                        }
-                    }
-
-                    std.log.info("Tunneling TCP stream via Hub to {s}:{d} ({d} bytes)...", .{ domain, tcp_res.dst_port, tcp_res.payload.len });
-
-                    var fake_ip_copy: [4]u8 = undefined;
-                    var client_ip_copy: [4]u8 = undefined;
-                    @memcpy(&fake_ip_copy, target_ip);
-                    @memcpy(&client_ip_copy, client_ip);
-
-                    var payload_copy: [2048]u8 = undefined;
-                    @memcpy(payload_copy[0..tcp_res.payload.len], tcp_res.payload);
-
-                    const fw_thread = std.Thread.spawn(.{}, forwardTcpStream, .{
+                    _ = openFlowSession(
+                        allocator,
                         tun_dev,
-                        fake_ip_copy,
-                        client_ip_copy,
-                        tcp_res.dst_port,
+                        client_ip.*,
+                        target_ip.*,
                         tcp_res.src_port,
+                        tcp_res.dst_port,
                         domain,
-                        payload_copy[0..tcp_res.payload.len],
-                        tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len)),
                         hub_host,
                         hub_port,
-                    }) catch null;
-                    if (fw_thread) |t| t.detach();
+                    );
+                } else if (tcp_res.payload.len > 0) {
+                    map_mutex.lock();
+                    const maybe_session = session_map.get(tcp_res.src_port);
+                    map_mutex.unlock();
+
+                    var session = maybe_session;
+                    if (session == null) {
+                        session = openFlowSession(
+                            allocator,
+                            tun_dev,
+                            client_ip.*,
+                            target_ip.*,
+                            tcp_res.src_port,
+                            tcp_res.dst_port,
+                            domain,
+                            hub_host,
+                            hub_port,
+                        );
+                    }
+
+                    if (session) |s| {
+                        s.client_ack = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
+
+                        var ack_buf: [128]u8 = undefined;
+                        const ack_len = tcp_engine.buildTcpPacket(
+                            target_ip.*,
+                            client_ip.*,
+                            tcp_res.dst_port,
+                            tcp_res.src_port,
+                            s.server_seq,
+                            s.client_ack,
+                            0x10,
+                            &.{},
+                            &ack_buf,
+                        );
+                        if (ack_len) |l| {
+                            _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
+                        }
+
+                        s.tls_client.writer.writeAll(tcp_res.payload) catch {};
+                        s.tls_client.writer.flush() catch {};
+                        std.log.info("Streamed {d} bytes to {s}:{d} (total flow ack: {d})", .{ tcp_res.payload.len, domain, tcp_res.dst_port, s.client_ack });
+                    }
                 }
             }
         }
@@ -336,6 +399,9 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    session_map = std.AutoHashMap(u16, *TcpSession).init(allocator);
+    defer session_map.deinit();
 
     const act = posix.Sigaction{
         .handler = .{ .handler = handleSig },
@@ -502,7 +568,7 @@ pub fn main() !void {
     if (maybe_tun != null) {
         setupRoutes();
         resolv_guard.capture();
-        const pump_thread = std.Thread.spawn(.{}, runTunPump, .{ maybe_tun.?, host_part, port_part }) catch null;
+        const pump_thread = std.Thread.spawn(.{}, runTunPump, .{ allocator, maybe_tun.?, host_part, port_part }) catch null;
         if (pump_thread) |t| t.detach();
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
