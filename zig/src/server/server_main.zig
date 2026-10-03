@@ -9,8 +9,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var args_iter = try std.process.argsWithAllocator(allocator);
-    defer args
-_iter.deinit();
+    defer args_iter.deinit();
 
     var listen_port: u16 = 4000;
     var socket_path: ?[]const u8 = null;
