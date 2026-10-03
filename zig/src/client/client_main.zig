@@ -8,7 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var server_addr_str: []const u8 = "34.88.228.23:4000";
+    var server_addr_str: []const u8 = "34.88.228.23:80";
 
     var args_iter = try std.process.argsWithAllocator(allocator);
     defer args_iter.deinit();
