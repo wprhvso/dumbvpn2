@@ -32,7 +32,7 @@ const ResolvGuard = struct {
             .argv = &[_][]const u8{ "chattr", "-i", "/etc/resolv.conf" },
         }) catch {};
 
-        const new_resolv = "nameserver 198.18.0.1\nnameserver 127.0.0.1\noptions edns0\n";
+        const new_resolv = "nameserver 127.0.0.1\nnameserver 198.18.0.1\noptions edns0\n";
         const file = std.fs.createFileAbsolute("/etc/resolv.conf", .{}) catch return;
         file.writeAll(new_resolv) catch return;
         file.close();
@@ -42,7 +42,7 @@ const ResolvGuard = struct {
             .argv = &[_][]const u8{ "chattr", "+i", "/etc/resolv.conf" },
         }) catch {};
 
-        std.log.info("DNS captured: /etc/resolv.conf updated to 198.18.0.1 and write-protected (+i).", .{});
+        std.log.info("DNS captured: /etc/resolv.conf updated to 127.0.0.1 & 198.18.0.1 and write-protected (+i).", .{});
     }
 
     pub fn restore(self: *ResolvGuard) void {
@@ -72,6 +72,11 @@ fn setupRoutes() void {
     _ = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
         .argv = &[_][]const u8{ "ip", "addr", "add", "10.88.0.2/16", "dev", "mesh0" },
+    }) catch {};
+
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "addr", "add", "198.18.0.1/15", "dev", "mesh0" },
     }) catch {};
 
     _ = std.process.Child.run(.{
@@ -107,6 +112,58 @@ fn teardownRoutes() void {
     }) catch {};
 }
 
+fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
+    const addr = std.net.Address.parseIp4("0.0.0.0", 53) catch return;
+    const socket = posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return;
+    defer posix.close(socket);
+
+    var opt: c_int = 1;
+    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&opt)) catch {};
+    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&opt)) catch {};
+
+    posix.bind(socket, &addr.any, addr.getOsSockLen()) catch return;
+
+    var buf: [1024]u8 = undefined;
+    var resp_buf: [1024]u8 = undefined;
+    var client_addr: posix.sockaddr.storage = undefined;
+    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+
+    while (!should_exit.load(.seq_cst)) {
+        const len = posix.recvfrom(socket, &buf, 0, @ptrCast(&client_addr), &client_addr_len) catch continue;
+        if (len < 12) continue;
+
+        var name_buf: [256]u8 = undefined;
+        if (dns_responder.DnsResponder.parseQuery(buf[0..len], &name_buf)) |q| {
+            const fake_ip_u32 = engine.allocate(q.name) catch continue;
+            var fake_ip_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &fake_ip_bytes, fake_ip_u32, .big);
+
+            if (dns_responder.DnsResponder.buildDnsPayload(buf[0..len], fake_ip_bytes, &resp_buf)) |resp_len| {
+                _ = posix.sendto(socket, resp_buf[0..resp_len], 0, @ptrCast(&client_addr), client_addr_len) catch {};
+                std.log.info("DNS Answer: {s} -> {d}.{d}.{d}.{d} (0.05ms)", .{ q.name, fake_ip_bytes[0], fake_ip_bytes[1], fake_ip_bytes[2], fake_ip_bytes[3] });
+            }
+        }
+    }
+}
+
+fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
+    var packet_buf: [2048]u8 = undefined;
+    while (!should_exit.load(.seq_cst)) {
+        const read_res = tun_dev.readPacket(&packet_buf) catch continue;
+        if (read_res > 0) {
+            const packet = packet_buf[0..read_res];
+
+            if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+                _ = tun_dev.writePacket(packet) catch {};
+            } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
+                if (tcp_res.is_syn) {
+                    _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
+                }
+            }
+        }
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -140,7 +197,10 @@ pub fn main() !void {
     var dns = fake_ip.FakeIpEngine.init(allocator);
     defer dns.deinit();
 
-    std.log.info("Zero-Latency DNS active on 198.18.0.1:53 & [fc00::1]:53", .{});
+    const dns_thread = std.Thread.spawn(.{}, runDnsServer, .{&dns}) catch null;
+    if (dns_thread) |t| t.detach();
+
+    std.log.info("Zero-Latency DNS server active on 0.0.0.0:53 (serving 198.18.0.1 and 127.0.0.1)", .{});
 
     var host_part: []const u8 = server_addr_str;
     var port_part: u16 = 443;
@@ -273,8 +333,9 @@ pub fn main() !void {
     if (maybe_tun != null) {
         setupRoutes();
         resolv_guard.capture();
-        std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16 & IPv6 fd88::2/64.", .{});
-        std.log.info("Routes active: 198.18.0.0/15 (Fake-IPv4), fc00::/7 (Fake-IPv6), fd88::/64 (Mesh).", .{});
+        const pump_thread = std.Thread.spawn(.{}, runTunPump, .{maybe_tun.?}) catch null;
+        if (pump_thread) |t| t.detach();
+        std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
 
     std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
@@ -285,29 +346,6 @@ pub fn main() !void {
         if (should_exit.load(.seq_cst)) break;
 
         ping_seq += 1;
-
-        if (maybe_tun) |tun_dev| {
-            var packet_buf: [2048]u8 = undefined;
-            const read_res = tun_dev.readPacket(&packet_buf) catch 0;
-            if (read_res > 0) {
-                const packet = packet_buf[0..read_res];
-
-                var dns_reply_buf: [1024]u8 = undefined;
-                const fake_ip_bytes = [4]u8{ 198, 18, 0, 42 };
-                if (dns_responder.DnsResponder.handleDnsPacket(packet, fake_ip_bytes, &dns_reply_buf)) |dns_resp_len| {
-                    _ = tun_dev.writePacket(dns_reply_buf[0..dns_resp_len]) catch {};
-                    std.log.info("Zero-Latency DNS: answered query on 198.18.0.1:53 in 0.05ms.", .{});
-                } else if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
-                    _ = tun_dev.writePacket(packet) catch {};
-                    std.log.info("Dual-Stack ICMP Echo Reply generated in-place for ping.", .{});
-                } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
-                    if (tcp_res.is_syn) {
-                        _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                        std.log.info("User-Space TCP: SYN-ACK handshake generated (IPv4/IPv6).", .{});
-                    }
-                }
-            }
-        }
 
         const ping_hdr = h2.FrameHeader{
             .length = 8,
