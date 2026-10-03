@@ -13,6 +13,14 @@ const dns_responder = @import("tun/dns_responder.zig");
 var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var global_dns: ?*fake_ip.FakeIpEngine = null;
 
+var active_fake_ip = [4]u8{ 198, 18, 0, 3 };
+var active_client_ip = [4]u8{ 10, 88, 0, 2 };
+var active_client_port: u16 = 0;
+var active_target_port: u16 = 443;
+var active_server_seq: u32 = 0x10000001;
+var active_client_seq: u32 = 0;
+var writer_mutex: std.Thread.Mutex = .{};
+
 fn handleSig(sig: i32) callconv(.c) void {
     _ = sig;
     should_exit.store(true, .seq_cst);
@@ -142,6 +150,65 @@ fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
             if (dns_responder.DnsResponder.buildDnsPayload(buf[0..len], fake_ip_bytes, &resp_buf)) |resp_len| {
                 _ = posix.sendto(socket, resp_buf[0..resp_len], 0, @ptrCast(&client_addr), client_addr_len) catch {};
                 std.log.info("DNS Answer: {s} -> {d}.{d}.{d}.{d} (0.05ms)", .{ q.name, fake_ip_bytes[0], fake_ip_bytes[1], fake_ip_bytes[2], fake_ip_bytes[3] });
+            }
+        }
+    }
+}
+
+fn runTunnelReader(tun_dev: @import("tun/device.zig").TunDevice, reader: anytype) void {
+    var raw_hdr: [9]u8 = undefined;
+    var data_buf: [16384]u8 = undefined;
+    var tcp_pkt_buf: [16384 + 128]u8 = undefined;
+
+    while (!should_exit.load(.seq_cst)) {
+        for (&raw_hdr) |*b| {
+            b.* = reader.takeByte() catch return;
+        }
+        const frame = h2.FrameHeader.decode(&raw_hdr);
+
+        if (frame.frame_type == .data and frame.stream_id == 1) {
+            const len = @min(frame.length, data_buf.len);
+            var i: usize = 0;
+            while (i < frame.length) : (i += 1) {
+                const b = reader.takeByte() catch return;
+                if (i < len) data_buf[i] = b;
+            }
+            if (len == 0) continue;
+
+            var payload = data_buf[0..len];
+            if (payload.len >= 2 and payload[0] == 0x82) {
+                var offset: usize = 2;
+                if (payload[1] == 126) {
+                    offset = 4;
+                } else if (payload[1] == 127) {
+                    offset = 10;
+                }
+                if (payload.len >= offset) {
+                    payload = payload[offset..];
+                }
+            }
+            if (payload.len == 0) continue;
+
+            const pkt_len = tcp_engine.buildTcpPacket(
+                active_fake_ip,
+                active_client_ip,
+                active_target_port,
+                active_client_port,
+                active_server_seq,
+                active_client_seq,
+                0x18,
+                payload,
+                &tcp_pkt_buf,
+            );
+            if (pkt_len) |l| {
+                _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
+                active_server_seq += @intCast(payload.len);
+                std.log.info("Hub response: delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{payload.len});
+            }
+        } else {
+            var i: usize = 0;
+            while (i < frame.length) : (i += 1) {
+                _ = reader.takeByte() catch return;
             }
         }
     }
@@ -317,14 +384,16 @@ pub fn main() !void {
     if (maybe_tun != null) {
         setupRoutes();
         resolv_guard.capture();
+        const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{ maybe_tun.?, &tls_client.reader }) catch null;
+        if (reader_t) |t| t.detach();
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
 
-    std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
+    std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Ready to route full system traffic. Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (!should_exit.load(.seq_cst)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(20 * std.time.ns_per_ms);
         if (should_exit.load(.seq_cst)) break;
 
         if (maybe_tun) |tun_dev| {
@@ -348,6 +417,13 @@ pub fn main() !void {
                     }
 
                     if (tcp_res.is_syn) {
+                        active_client_port = tcp_res.src_port;
+                        active_target_port = tcp_res.dst_port;
+                        active_fake_ip = target_ip.*;
+                        active_client_ip = client_ip.*;
+                        active_client_seq = tcp_res.seq + 1;
+                        active_server_seq = 0x10000001;
+
                         _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
                         std.log.info("User-Space TCP: SYN-ACK handshake generated for {s}:{d} (flow port {d}).", .{ domain, tcp_res.dst_port, tcp_res.src_port });
 
@@ -369,21 +445,24 @@ pub fn main() !void {
                             .stream_id = 1,
                         };
                         data_frame.encode(&hdr_buf);
-                        tls_client.writer.writeAll(&hdr_buf) catch break;
-                        tls_client.writer.writeAll(connect_payload[0 .. 8 + p_len]) catch break;
-                        tls_client.writer.flush() catch break;
-                        stream_writer.interface.flush() catch break;
+                        writer_mutex.lock();
+                        tls_client.writer.writeAll(&hdr_buf) catch {};
+                        tls_client.writer.writeAll(connect_payload[0 .. 8 + p_len]) catch {};
+                        tls_client.writer.flush() catch {};
+                        stream_writer.interface.flush() catch {};
+                        writer_mutex.unlock();
                         std.log.info("Sent MMX CONNECT for {s}:{d} over HTTP/2 Stream 1!", .{ domain, tcp_res.dst_port });
                     } else if (tcp_res.payload.len > 0) {
+                        active_client_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
+
                         var ack_buf: [128]u8 = undefined;
-                        const client_ack_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
                         const ack_len = tcp_engine.buildTcpPacket(
                             target_ip.*,
                             client_ip.*,
                             tcp_res.dst_port,
                             tcp_res.src_port,
-                            0x10000001,
-                            client_ack_seq,
+                            active_server_seq,
+                            active_client_seq,
                             0x10,
                             &.{},
                             &ack_buf,
@@ -399,10 +478,12 @@ pub fn main() !void {
                             .stream_id = 1,
                         };
                         data_frame.encode(&hdr_buf);
-                        tls_client.writer.writeAll(&hdr_buf) catch break;
-                        tls_client.writer.writeAll(tcp_res.payload) catch break;
-                        tls_client.writer.flush() catch break;
-                        stream_writer.interface.flush() catch break;
+                        writer_mutex.lock();
+                        tls_client.writer.writeAll(&hdr_buf) catch {};
+                        tls_client.writer.writeAll(tcp_res.payload) catch {};
+                        tls_client.writer.flush() catch {};
+                        stream_writer.interface.flush() catch {};
+                        writer_mutex.unlock();
                         std.log.info("Streamed {d} bytes to {s}:{d} over HTTP/2!", .{ tcp_res.payload.len, domain, tcp_res.dst_port });
                     }
                 }
@@ -410,7 +491,7 @@ pub fn main() !void {
         }
 
         ping_seq += 1;
-        if (ping_seq % 50 == 0) {
+        if (ping_seq % 250 == 0) {
             const ping_hdr = h2.FrameHeader{
                 .length = 8,
                 .frame_type = .ping,
@@ -418,11 +499,13 @@ pub fn main() !void {
                 .stream_id = 0,
             };
             ping_hdr.encode(&hdr_buf);
-            tls_client.writer.writeAll(&hdr_buf) catch break;
-            tls_client.writer.writeAll("PINGPING") catch break;
-            tls_client.writer.flush() catch break;
-            stream_writer.interface.flush() catch break;
-            std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq / 50});
+            writer_mutex.lock();
+            tls_client.writer.writeAll(&hdr_buf) catch {};
+            tls_client.writer.writeAll("PINGPING") catch {};
+            tls_client.writer.flush() catch {};
+            stream_writer.interface.flush() catch {};
+            writer_mutex.unlock();
+            std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq / 250});
         }
     }
 
