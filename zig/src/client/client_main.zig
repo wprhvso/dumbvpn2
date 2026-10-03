@@ -195,6 +195,8 @@ fn writeTunnelFrameH2(
 fn runTunnelReader(
     tun_dev: @import("tun/device.zig").TunDevice,
     reader: anytype,
+    tls_writer: anytype,
+    stream_writer: anytype,
     flow_table: *flow_table_mod.FlowTable,
     tun_mtx: *std.Thread.Mutex,
 ) void {
@@ -204,7 +206,12 @@ fn runTunnelReader(
     while (!should_exit.load(.seq_cst)) {
         var raw_hdr: [9]u8 = undefined;
         for (&raw_hdr) |*b| {
-            b.* = reader.takeByte() catch return;
+            b.* = reader.takeByte() catch |err| {
+                if (should_exit.load(.seq_cst)) return;
+                std.log.err("Tunnel connection closed or read error: {any}", .{err});
+                should_exit.store(true, .seq_cst);
+                return;
+            };
         }
         const frame = h2.FrameHeader.decode(&raw_hdr);
 
@@ -217,6 +224,19 @@ fn runTunnelReader(
                     dest[0] = b;
                     parser.advance(1);
                 }
+            }
+
+            if (frame.length > 0) {
+                var win_buf: [13]u8 = undefined;
+                const len_u31: u31 = @intCast(@min(frame.length, 0x7FFFFFFF));
+                _ = h2.buildWindowUpdate(1, len_u31, &win_buf);
+                writer_mutex.lock();
+                tls_writer.writeAll(&win_buf) catch {};
+                _ = h2.buildWindowUpdate(0, len_u31, &win_buf);
+                tls_writer.writeAll(&win_buf) catch {};
+                tls_writer.flush() catch {};
+                stream_writer.flush() catch {};
+                writer_mutex.unlock();
             }
 
             while (parser.next()) |mmx_frame| {
@@ -281,6 +301,26 @@ fn runTunnelReader(
                     }
                 }
             }
+        } else if (frame.frame_type == .ping and (frame.flags & 0x01) == 0) {
+            var ping_payload: [8]u8 = undefined;
+            for (&ping_payload) |*b| {
+                b.* = reader.takeByte() catch return;
+            }
+            const pong_hdr = h2.FrameHeader{
+                .length = 8,
+                .frame_type = .ping,
+                .flags = 0x01,
+                .stream_id = 0,
+            };
+            var pong_hdr_buf: [9]u8 = undefined;
+            pong_hdr.encode(&pong_hdr_buf);
+
+            writer_mutex.lock();
+            tls_writer.writeAll(&pong_hdr_buf) catch {};
+            tls_writer.writeAll(&ping_payload) catch {};
+            tls_writer.flush() catch {};
+            stream_writer.flush() catch {};
+            writer_mutex.unlock();
         } else {
             var i: usize = 0;
             while (i < frame.length) : (i += 1) {
@@ -512,9 +552,13 @@ pub fn main() !void {
     const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     try tls_client.writer.writeAll(PREFACE);
 
-    var settings_payload: [6]u8 = undefined;
-    std.mem.writeInt(u16, settings_payload[0..2], 0x0008, .big);
+    var settings_payload: [18]u8 = undefined;
+    std.mem.writeInt(u16, settings_payload[0..2], 0x0008, .big); // ENABLE_CONNECT_PROTOCOL
     std.mem.writeInt(u32, settings_payload[2..6], 1, .big);
+    std.mem.writeInt(u16, settings_payload[6..8], 0x0004, .big); // INITIAL_WINDOW_SIZE
+    std.mem.writeInt(u32, settings_payload[8..12], 0x40000000, .big);
+    std.mem.writeInt(u16, settings_payload[12..14], 0x0005, .big); // MAX_FRAME_SIZE
+    std.mem.writeInt(u32, settings_payload[14..18], 16384, .big);
 
     const settings_hdr = h2.FrameHeader{
         .length = settings_payload.len,
@@ -526,6 +570,10 @@ pub fn main() !void {
     settings_hdr.encode(&hdr_buf);
     try tls_client.writer.writeAll(&hdr_buf);
     try tls_client.writer.writeAll(&settings_payload);
+
+    var init_win_buf: [13]u8 = undefined;
+    _ = h2.buildWindowUpdate(0, 0x40000000, &init_win_buf);
+    try tls_client.writer.writeAll(&init_win_buf);
 
     var hpack_buf: [512]u8 = undefined;
     var hpack_len: usize = 0;
@@ -621,6 +669,8 @@ pub fn main() !void {
         const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{
             maybe_tun.?,
             &tls_client.reader,
+            &tls_client.writer,
+            &stream_writer.interface,
             &flow_table,
             &tun_mutex,
         }) catch null;

@@ -33,7 +33,7 @@ pub const Flow = struct {
 };
 
 pub const FlowTable = struct {
-    flows: std.AutoHashMap(u32, Flow),
+    flows: std.AutoHashMap(u32, *Flow),
     key_to_stream: std.AutoHashMap(FlowKey, u32),
     next_stream_id: u32 = 1,
     mutex: std.Thread.Mutex = .{},
@@ -41,13 +41,17 @@ pub const FlowTable = struct {
 
     pub fn init(allocator: std.mem.Allocator) FlowTable {
         return .{
-            .flows = std.AutoHashMap(u32, Flow).init(allocator),
+            .flows = std.AutoHashMap(u32, *Flow).init(allocator),
             .key_to_stream = std.AutoHashMap(FlowKey, u32).init(allocator),
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FlowTable) void {
+        var it = self.flows.valueIterator();
+        while (it.next()) |flow_ptr| {
+            self.allocator.destroy(flow_ptr.*);
+        }
         self.flows.deinit();
         self.key_to_stream.deinit();
     }
@@ -72,7 +76,7 @@ pub const FlowTable = struct {
         };
 
         if (self.key_to_stream.get(key)) |stream_id| {
-            if (self.flows.getPtr(stream_id)) |existing| {
+            if (self.flows.get(stream_id)) |existing| {
                 return existing;
             }
         }
@@ -80,7 +84,8 @@ pub const FlowTable = struct {
         const stream_id = self.next_stream_id;
         self.next_stream_id += 1;
 
-        var flow = Flow{
+        const flow = try self.allocator.create(Flow);
+        flow.* = .{
             .stream_id = stream_id,
             .client_ip = client_ip,
             .fake_ip = fake_ip,
@@ -97,7 +102,7 @@ pub const FlowTable = struct {
 
         try self.flows.put(stream_id, flow);
         try self.key_to_stream.put(key, stream_id);
-        return self.flows.getPtr(stream_id).?;
+        return flow;
     }
 
     pub fn lookupByKey(self: *FlowTable, client_ip: [4]u8, fake_ip: [4]u8, client_port: u16, target_port: u16) ?*Flow {
@@ -111,7 +116,7 @@ pub const FlowTable = struct {
             .target_port = target_port,
         };
         if (self.key_to_stream.get(key)) |stream_id| {
-            return self.flows.getPtr(stream_id);
+            return self.flows.get(stream_id);
         }
         return null;
     }
@@ -119,14 +124,15 @@ pub const FlowTable = struct {
     pub fn lookupByStream(self: *FlowTable, stream_id: u32) ?*Flow {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.flows.getPtr(stream_id);
+        return self.flows.get(stream_id);
     }
 
     pub fn remove(self: *FlowTable, stream_id: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.flows.get(stream_id)) |flow| {
+        if (self.flows.fetchRemove(stream_id)) |kv| {
+            const flow = kv.value;
             const key = FlowKey{
                 .client_ip = flow.client_ip,
                 .fake_ip = flow.fake_ip,
@@ -134,7 +140,7 @@ pub const FlowTable = struct {
                 .target_port = flow.target_port,
             };
             _ = self.key_to_stream.remove(key);
-            _ = self.flows.remove(stream_id);
+            self.allocator.destroy(flow);
         }
     }
 };

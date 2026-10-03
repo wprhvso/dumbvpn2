@@ -41,6 +41,18 @@ pub const FrameHeader = struct {
     }
 };
 
+pub fn buildWindowUpdate(stream_id: u32, increment: u31, buf: *[13]u8) usize {
+    const hdr = FrameHeader{
+        .length = 4,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = stream_id,
+    };
+    hdr.encode(buf[0..9]);
+    std.mem.writeInt(u32, buf[9..13], increment & 0x7FFFFFFF, .big);
+    return 13;
+}
+
 pub fn encodeLiteralHeader(dest: []u8, name: []const u8, val: []const u8) usize {
     var offset: usize = 0;
     dest[offset] = 0x00;
