@@ -104,6 +104,7 @@ const ResolvGuard = struct {
 
 fn setupRoutes(allocator: std.mem.Allocator) void {
     const ip_bin = findIpBin();
+    runCmd(allocator, &[_][]const u8{ ip_bin, "link", "set", "mesh0", "mtu", "65535" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "link", "set", "mesh0", "up" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "10.88.0.2/16", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "198.18.0.1/15", "dev", "mesh0" });
@@ -221,30 +222,42 @@ fn runTunnelReader(
             while (parser.next()) |mmx_frame| {
                 if (mmx_frame.header.frame_type == .data) {
                     if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
-                        const pkt_len = tcp_engine.buildTcpPacket(
-                            flow.fake_ip,
-                            flow.client_ip,
-                            flow.target_port,
-                            flow.client_port,
-                            flow.server_seq,
-                            flow.client_seq,
-                            0x18,
-                            mmx_frame.payload,
-                            &tcp_pkt_buf,
-                        );
-                        if (pkt_len) |l| {
-                            tun_mtx.lock();
-                            _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
-                            tun_mtx.unlock();
+                        const MSS: usize = 1420;
+                        var offset: usize = 0;
+                        while (offset < mmx_frame.payload.len) {
+                            const chunk_len = @min(MSS, mmx_frame.payload.len - offset);
+                            const is_last = (offset + chunk_len == mmx_frame.payload.len);
+                            const flags: u8 = if (is_last) 0x18 else 0x10;
+                            const chunk = mmx_frame.payload[offset .. offset + chunk_len];
 
-                            flow.server_seq += @intCast(mmx_frame.payload.len);
-                            std.log.info("Hub response: flow {d} ({s}:{d}) delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{
-                                flow.stream_id,
-                                flow.getDomain(),
+                            const pkt_len = tcp_engine.buildTcpPacket(
+                                flow.fake_ip,
+                                flow.client_ip,
                                 flow.target_port,
-                                mmx_frame.payload.len,
-                            });
+                                flow.client_port,
+                                flow.server_seq,
+                                flow.client_seq,
+                                flags,
+                                chunk,
+                                &tcp_pkt_buf,
+                            );
+                            if (pkt_len) |l| {
+                                tun_mtx.lock();
+                                _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch |err| {
+                                    std.log.err("Failed to write to mesh0 ({d} bytes): {any}", .{ l, err });
+                                };
+                                tun_mtx.unlock();
+                                flow.server_seq += @intCast(chunk_len);
+                            }
+                            offset += chunk_len;
                         }
+
+                        std.log.info("Hub response: flow {d} ({s}:{d}) delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{
+                            flow.stream_id,
+                            flow.getDomain(),
+                            flow.target_port,
+                            mmx_frame.payload.len,
+                        });
                     }
                 } else if (mmx_frame.header.frame_type == .close) {
                     if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
