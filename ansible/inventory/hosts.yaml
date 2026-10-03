@@ -2,15 +2,7 @@ all:
   children:
     hubs:
       hosts:
-        hub-frankfurt:
-          ansible_host: 198.51.100.1
-          region: eu-central
-        hub-helsinki:
-          ansible_host: 198.51.100.2
-          region: eu-north
-        hub-amsterdam:
-          ansible_host: 198.51.100.3
-          region: eu-west
-        hub-almaty:
-          ansible_host: 198.51.100.4
-          region: asia-central
+        cloud-hub:
+          ansible_host: 34.88.228.23
+          ansible_user: pectinkne_pecrucks_restcuts
+          region: cloud-primary

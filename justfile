@@ -6,7 +6,7 @@ build-ui:
     mkdir -p zig/src/server/assets
     cp -r svelte/dist/* zig/src/server/assets/
 
-build-server target="x86_64-linux-musl":
+build-server target="x86_64-linux-musl": build-ui
     cd zig && zig build -Dtarget={{target}} -Doptimize=ReleaseFast server
 
 build-client:
@@ -29,8 +29,18 @@ build-apk: build-android-core
 test:
     cd zig && zig build test --summary all
 
-deploy-all:
+run-server: build-server
+    ./zig/zig-out/bin/mesh-server
+
+run-client: build-client
+    ./zig/zig-out/bin/mesh-client
+
+deploy: build-server
     ansible-playbook -i ansible/inventory/hosts.yaml ansible/playbooks/site.yaml
 
-deploy-server:
+deploy-server: build-server
     ansible-playbook -i ansible/inventory/hosts.yaml ansible/playbooks/deploy-server.yaml
+
+deploy-quick target="pectinkne_pecrucks_restcuts@34.88.228.23": build-server
+    scp zig/zig-out/bin/mesh-server {{target}}:/tmp/mesh-server
+    ssh {{target}} "sudo mv /tmp/mesh-server /usr/local/bin/mesh-server && sudo chmod +x /usr/local/bin/mesh-server"
