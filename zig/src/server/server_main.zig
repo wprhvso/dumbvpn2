@@ -5,12 +5,38 @@ const embedded_ui = @import("embedded_ui.zig");
 const common = @import("common");
 const protocol = common.protocol;
 
-fn pump(src: std.net.Stream, dst: std.net.Stream) void {
+fn pumpWsToTarget(src: std.net.Stream, dst: std.net.Stream) void {
     var buf: [16384]u8 = undefined;
     while (true) {
         const len = src.read(&buf) catch break;
         if (len == 0) break;
         dst.writeAll(buf[0..len]) catch break;
+    }
+}
+
+fn pumpTargetToWs(src: std.net.Stream, dst: std.net.Stream) void {
+    var buf: [16384]u8 = undefined;
+    var ws_frame_buf: [16384 + 10]u8 = undefined;
+    while (true) {
+        const len = src.read(&buf) catch break;
+        if (len == 0) break;
+
+        var offset: usize = 0;
+        ws_frame_buf[0] = 0x82;
+        if (len < 126) {
+            ws_frame_buf[1] = @intCast(len);
+            offset = 2;
+        } else if (len <= 65535) {
+            ws_frame_buf[1] = 126;
+            std.mem.writeInt(u16, ws_frame_buf[2..4], @intCast(len), .big);
+            offset = 4;
+        } else {
+            ws_frame_buf[1] = 127;
+            std.mem.writeInt(u64, ws_frame_buf[2..10], @intCast(len), .big);
+            offset = 10;
+        }
+        @memcpy(ws_frame_buf[offset .. offset + len], buf[0..len]);
+        dst.writeAll(ws_frame_buf[0 .. offset + len]) catch break;
     }
 }
 
@@ -70,17 +96,15 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
 
                     if (target_host.len > 0) {
                         std.log.info("Proxying CONNECT to {s}:{d}...", .{ target_host, target_port });
-                        const target_stream = std.net.tcpConnectToHost(allocator, target_host, target_port) catch |err| {
-                            std.log.warn("Failed to connect to target {s}:{d}: {any}", .{ target_host, target_port, err });
-                            break;
-                        };
+                        const target_stream = std.net.tcpConnectToHost(allocator, target_host, target_port) catch break;
                         defer target_stream.close();
 
-                        _ = conn.stream.writeAll(&[_]u8{ 0x82, 0x08, 0, 0, 0, 1, 0x01, 0, 0, 0 }) catch break;
+                        const ack_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 1, 0x01, 0, 0, 0 };
+                        _ = conn.stream.writeAll(&ack_frame) catch break;
 
-                        const t1 = std.Thread.spawn(.{}, pump, .{ conn.stream, target_stream }) catch break;
+                        const t1 = std.Thread.spawn(.{}, pumpWsToTarget, .{ conn.stream, target_stream }) catch break;
                         t1.detach();
-                        pump(target_stream, conn.stream);
+                        pumpTargetToWs(target_stream, conn.stream);
                         break;
                     }
                 }
