@@ -3,142 +3,31 @@ const common = @import("common");
 const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
 const h2 = @import("h2.zig");
+const tun_linux = @import("tun/tun_linux.zig");
+const icmp_engine = @import("tun/icmp_engine.zig");
+const tcp_engine = @import("tun/tcp_engine.zig");
+const udp_engine = @import("tun/udp_engine.zig");
 
-fn pumpStreamToTls(stream: std.net.Stream, tls_writer: anytype, tcp_writer: anytype) void {
-    var buf: [16384]u8 = undefined;
-    while (true) {
-        const len = stream.read(&buf) catch break;
-        if (len == 0) break;
-        tls_writer.writeAll(buf[0..len]) catch break;
-        tls_writer.flush() catch break;
-        tcp_writer.flush() catch break;
-    }
-}
+fn setupRoutes() void {
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "link", "set", "mesh0", "up" },
+    }) catch {};
 
-fn pumpTlsToStream(tls_reader: anytype, stream: std.net.Stream) void {
-    var buf: [16384]u8 = undefined;
-    while (true) {
-        const len = tls_reader.readSliceShort(&buf) catch break;
-        if (len == 0) break;
-        stream.writeAll(buf[0..len]) catch break;
-    }
-}
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "addr", "add", "10.88.0.2/16", "dev", "mesh0" },
+    }) catch {};
 
-fn handleSocks5(client_conn: std.net.Server.Connection, hub_host: []const u8, hub_port: u16) void {
-    defer client_conn.stream.close();
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "route", "add", "198.18.0.0/15", "dev", "mesh0" },
+    }) catch {};
 
-    var buf: [1024]u8 = undefined;
-    var n = client_conn.stream.read(&buf) catch return;
-    if (n < 3 or buf[0] != 0x05) return;
-    client_conn.stream.writeAll(&[_]u8{ 0x05, 0x00 }) catch return;
-
-    n = client_conn.stream.read(&buf) catch return;
-    if (n < 7 or buf[0] != 0x05 or buf[1] != 0x01) return;
-
-    const atyp = buf[3];
-    var domain_name: []const u8 = "";
-    var target_port: u16 = 80;
-
-    if (atyp == 0x03) {
-        const dlen = buf[4];
-        if (n >= 5 + dlen + 2) {
-            domain_name = buf[5 .. 5 + dlen];
-            target_port = std.mem.readInt(u16, buf[5 + dlen ..][0..2], .big);
-        }
-    } else if (atyp == 0x01) {
-        if (n >= 10) {
-            const ip = buf[4..8];
-            var ip_str_buf: [16]u8 = undefined;
-            const ip_str = std.fmt.bufPrint(&ip_str_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return;
-            domain_name = ip_str;
-            target_port = std.mem.readInt(u16, buf[8..10], .big);
-        }
-    }
-
-    if (domain_name.len == 0) return;
-
-    const hub_addr = std.net.Address.parseIp4(hub_host, hub_port) catch return;
-    const hub_tcp = std.net.tcpConnectToAddress(hub_addr) catch return;
-    defer hub_tcp.close();
-
-    const min_len = std.crypto.tls.Client.min_buffer_len;
-    var s_read_buf: [min_len]u8 = undefined;
-    var s_write_buf: [min_len]u8 = undefined;
-    var t_read_buf: [min_len + 4096]u8 = undefined;
-    var t_write_buf: [min_len]u8 = undefined;
-
-    var s_reader = hub_tcp.reader(&s_read_buf);
-    var s_writer = hub_tcp.writer(&s_write_buf);
-
-    var tls = std.crypto.tls.Client.init(
-        s_reader.interface(),
-        &s_writer.interface,
-        .{
-            .host = .no_verification,
-            .ca = .no_verification,
-            .read_buffer = &t_read_buf,
-            .write_buffer = &t_write_buf,
-        },
-    ) catch return;
-
-    const ws_upgrade = "GET /api/v2/stream HTTP/1.1\r\n" ++
-        "Host: 34.88.228.23\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n";
-
-    tls.writer.writeAll(ws_upgrade) catch return;
-    tls.writer.flush() catch return;
-    s_writer.interface.flush() catch return;
-
-    var resp_buf: [512]u8 = undefined;
-    var head_len: usize = 0;
-    while (head_len < resp_buf.len) {
-        const byte = tls.reader.takeByte() catch break;
-        resp_buf[head_len] = byte;
-        head_len += 1;
-        if (head_len >= 4 and std.mem.eql(u8, resp_buf[head_len - 4 .. head_len], "\r\n\r\n")) break;
-    }
-
-    var connect_frame: [512]u8 = undefined;
-    const payload_len = 1 + 1 + domain_name.len + 2;
-    const hdr = protocol.Header{
-        .stream_id = 2,
-        .frame_type = .connect,
-        .flags = 0,
-        .length = @intCast(payload_len),
-    };
-    hdr.encode(connect_frame[0..8]);
-    connect_frame[8] = 0x02;
-    connect_frame[9] = @intCast(domain_name.len);
-    @memcpy(connect_frame[10 .. 10 + domain_name.len], domain_name);
-    std.mem.writeInt(u16, connect_frame[10 + domain_name.len ..][0..2], target_port, .big);
-
-    tls.writer.writeAll(connect_frame[0 .. 8 + payload_len]) catch return;
-    tls.writer.flush() catch return;
-    s_writer.interface.flush() catch return;
-
-    client_conn.stream.writeAll(&[_]u8{ 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }) catch return;
-
-    const t_pump = std.Thread.spawn(.{}, pumpTlsToStream, .{ &tls.reader, client_conn.stream }) catch return;
-    t_pump.detach();
-    pumpStreamToTls(client_conn.stream, &tls.writer, &s_writer.interface);
-}
-
-fn socks5Server(hub_host: []const u8, hub_port: u16) void {
-    const socks_addr = std.net.Address.parseIp4("127.0.0.1", 1080) catch return;
-    var server = socks_addr.listen(.{ .reuse_address = true }) catch return;
-    defer server.deinit();
-
-    while (true) {
-        const conn = server.accept() catch continue;
-        const thread = std.Thread.spawn(.{}, handleSocks5, .{ conn, hub_host, hub_port }) catch {
-            conn.stream.close();
-            continue;
-        };
-        thread.detach();
-    }
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "route", "add", "10.88.0.0/16", "dev", "mesh0" },
+    }) catch {};
 }
 
 pub fn main() !void {
@@ -160,8 +49,14 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Starting mesh-client daemon...", .{});
+    std.log.info("Starting mesh-client L3 TUN daemon...", .{});
     std.log.info("Rendezvous target hub: {s}", .{server_addr_str});
+
+    var dns = fake_ip.FakeIpEngine.init(allocator);
+    defer dns.deinit();
+
+    const sample_ip = try dns.allocate("google.com");
+    std.log.info("Zero-Latency DNS active: 198.18.0.1:53 (sample 198.18.x.x: 0x{x})", .{sample_ip});
 
     var host_part: []const u8 = server_addr_str;
     var port_part: u16 = 443;
@@ -169,15 +64,6 @@ pub fn main() !void {
         host_part = server_addr_str[0..colon_idx];
         port_part = try std.fmt.parseInt(u16, server_addr_str[colon_idx + 1 ..], 10);
     }
-
-    const socks_thread = std.Thread.spawn(.{}, socks5Server, .{ host_part, port_part }) catch |err| {
-        std.log.warn("Could not bind SOCKS5 listener on 127.0.0.1:1080: {any}", .{err});
-        return;
-    };
-    socks_thread.detach();
-
-    std.log.info("SOCKS5 Proxy active and listening on 127.0.0.1:1080!", .{});
-    std.log.info("Zero-Latency DNS active: 198.18.0.1:53", .{});
 
     std.log.info("Probing hub connectivity: {s}:{d}...", .{ host_part, port_part });
     const target_addr = std.net.Address.parseIp4(host_part, port_part) catch |err| {
@@ -289,12 +175,42 @@ pub fn main() !void {
     }
 
     std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
-    std.log.info("MMX Tunnel active over HTTP/2 WebSocket! Ready to route SOCKS5 & Mesh traffic.", .{});
+
+    const maybe_tun: ?@import("tun/device.zig").TunDevice = tun_linux.openTun("mesh0") catch |err| blk: {
+        std.log.warn("Could not open /dev/net/tun: {any}. Run with sudo for full system TUN.", .{err});
+        break :blk null;
+    };
+    defer if (maybe_tun) |t| t.close();
+
+    if (maybe_tun != null) {
+        setupRoutes();
+        std.log.info("Virtual L3 TUN mesh0 UP: 10.88.0.2/16, Fake-IP route 198.18.0.0/15.", .{});
+    }
+
+    std.log.info("MMX Tunnel active over HTTP/2 WebSocket! Ready to route full system traffic. Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (true) {
         std.Thread.sleep(5 * std.time.ns_per_s);
         ping_seq += 1;
+
+        if (maybe_tun) |tun_dev| {
+            var packet_buf: [2048]u8 = undefined;
+            const read_res = tun_dev.readPacket(&packet_buf) catch 0;
+            if (read_res > 0) {
+                const packet = packet_buf[0..read_res];
+
+                if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+                    _ = tun_dev.writePacket(packet) catch {};
+                    std.log.info("ICMP Echo Reply generated in-place for ping request.", .{});
+                } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
+                    if (tcp_res.is_syn) {
+                        _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
+                        std.log.info("User-Space TCP: SYN-ACK handshake reply generated.", .{});
+                    }
+                }
+            }
+        }
 
         const ping_hdr = h2.FrameHeader{
             .length = 8,

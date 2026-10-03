@@ -9,7 +9,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/common/root.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
     });
 
     const server_mod = b.createModule(.{
@@ -24,7 +23,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/server/root.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
     });
     server_lib_mod.addImport("common", common_mod);
 
@@ -40,7 +38,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client/root.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
     });
     client_lib_mod.addImport("common", common_mod);
 
@@ -81,6 +78,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/test_all.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = false,
     });
     test_mod.addImport("common", common_mod);
     test_mod.addImport("server", server_lib_mod);

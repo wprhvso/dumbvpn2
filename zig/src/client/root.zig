@@ -1,5 +1,11 @@
 pub const fake_ip = @import("fake_ip.zig");
-pub const tcp_engine = @import("tcp_engine.zig");
 pub const lan_discovery = @import("lan_discovery.zig");
 pub const pool = @import("pool.zig");
 pub const migration = @import("migration.zig");
+pub const h2 = @import("h2.zig");
+pub const tcp_engine = @import("tun/tcp_engine.zig");
+pub const udp_engine = @import("tun/udp_engine.zig");
+pub const icmp_engine = @import("tun/icmp_engine.zig");
+pub const ip_checksum = @import("tun/ip_checksum.zig");
+pub const device = @import("tun/device.zig");
+pub const tun_linux = @import("tun/tun_linux.zig");
