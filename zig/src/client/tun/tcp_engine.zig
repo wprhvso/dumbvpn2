@@ -1,8 +1,90 @@
 const std = @import("std");
 const ip_checksum = @import("ip_checksum.zig");
 
+pub fn buildTcpPacket(
+    src_ip: [4]u8,
+    dst_ip: [4]u8,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: []const u8,
+    buf: []u8,
+) ?usize {
+    const ihl: usize = 20;
+    const tcp_hdr_len: usize = 20;
+    const total_len: usize = ihl + tcp_hdr_len + payload.len;
+    if (buf.len < total_len) return null;
+
+    buf[0] = 0x45;
+    buf[1] = 0x00;
+    std.mem.writeInt(u16, buf[2..4], @intCast(total_len), .big);
+    buf[4] = 0x00;
+    buf[5] = 0x01;
+    buf[6] = 0x40;
+    buf[7] = 0x00;
+    buf[8] = 64;
+    buf[9] = 6;
+    buf[10] = 0;
+    buf[11] = 0;
+    @memcpy(buf[12..16], &src_ip);
+    @memcpy(buf[16..20], &dst_ip);
+
+    const ip_ck = ip_checksum.calculateChecksum(buf[0..ihl]);
+    std.mem.writeInt(u16, buf[10..12], ip_ck, .big);
+
+    std.mem.writeInt(u16, buf[ihl..][0..2], src_port, .big);
+    std.mem.writeInt(u16, buf[ihl + 2 ..][0..2], dst_port, .big);
+    std.mem.writeInt(u32, buf[ihl + 4 ..][0..4], seq, .big);
+    std.mem.writeInt(u32, buf[ihl + 8 ..][0..4], ack, .big);
+    buf[ihl + 12] = (tcp_hdr_len / 4) << 4;
+    buf[ihl + 13] = flags;
+    std.mem.writeInt(u16, buf[ihl + 14 ..][0..2], 65535, .big);
+    buf[ihl + 16] = 0;
+    buf[ihl + 17] = 0;
+    buf[ihl + 18] = 0;
+    buf[ihl + 19] = 0;
+
+    if (payload.len > 0) {
+        @memcpy(buf[ihl + tcp_hdr_len .. total_len], payload);
+    }
+
+    var sum: u32 = 0;
+    var i: usize = 12;
+    while (i < 20) : (i += 2) {
+        sum += std.mem.readInt(u16, buf[i..][0..2], .big);
+    }
+    sum += 6;
+    sum += @as(u32, @intCast(tcp_hdr_len + payload.len));
+
+    i = ihl;
+    while (i + 1 < total_len) : (i += 2) {
+        sum += std.mem.readInt(u16, buf[i..][0..2], .big);
+    }
+    if (i < total_len) {
+        sum += @as(u32, buf[i]) << 8;
+    }
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    const tcp_ck = ~@as(u16, @intCast(sum));
+    std.mem.writeInt(u16, buf[ihl + 16 ..][0..2], tcp_ck, .big);
+
+    return total_len;
+}
+
 pub const TcpEngine = struct {
-    pub fn handlePacket(packet: []u8) ?struct { is_syn: bool, is_fin: bool, payload: []const u8, reply_len: usize } {
+    pub fn handlePacket(packet: []u8) ?struct {
+        is_syn: bool,
+        is_fin: bool,
+        payload: []const u8,
+        reply_len: usize,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+    } {
         if (packet.len < 40) return null;
         const version = packet[0] >> 4;
 
@@ -15,6 +97,10 @@ pub const TcpEngine = struct {
             const is_syn = (flags & 0x02) != 0;
             const is_fin = (flags & 0x01) != 0;
             const seq = std.mem.readInt(u32, packet[ihl + 4 ..][0..4], .big);
+            const ack = std.mem.readInt(u32, packet[ihl + 8 ..][0..4], .big);
+
+            const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
+            const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
 
             if (is_syn) {
                 var src_ip: [4]u8 = undefined;
@@ -24,28 +110,48 @@ pub const TcpEngine = struct {
                 @memcpy(packet[12..16], &dst_ip);
                 @memcpy(packet[16..20], &src_ip);
 
-                const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
-                const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
                 std.mem.writeInt(u16, packet[ihl..][0..2], dst_port, .big);
                 std.mem.writeInt(u16, packet[ihl + 2 ..][0..2], src_port, .big);
 
                 std.mem.writeInt(u32, packet[ihl + 4 ..][0..4], 0x10000000, .big);
                 std.mem.writeInt(u32, packet[ihl + 8 ..][0..4], seq + 1, .big);
-                packet[ihl + 13] = 0x12;
+                packet[ihl + 13] = 0x12; // SYN-ACK
                 std.mem.writeInt(u16, packet[ihl + 14 ..][0..2], 65535, .big);
 
                 packet[10] = 0;
                 packet[11] = 0;
                 const ip_cksum = ip_checksum.calculateChecksum(packet[0..ihl]);
-                std.mem.writeInt(u16, packet[10..][0..2], ip_cksum, .big);
+                std.mem.writeInt(u16, packet[10..12], ip_cksum, .big);
 
                 packet[ihl + 16] = 0;
                 packet[ihl + 17] = 0;
+
+                var sum: u32 = 0;
+                var j: usize = 12;
+                while (j < 20) : (j += 2) {
+                    sum += std.mem.readInt(u16, packet[j..][0..2], .big);
+                }
+                sum += 6;
+                sum += @as(u32, @intCast(tcp_offset));
+
+                j = ihl;
+                while (j + 1 < ihl + tcp_offset) : (j += 2) {
+                    sum += std.mem.readInt(u16, packet[j..][0..2], .big);
+                }
+                while ((sum >> 16) != 0) {
+                    sum = (sum & 0xFFFF) + (sum >> 16);
+                }
+                std.mem.writeInt(u16, packet[ihl + 16 ..][0..2], ~@as(u16, @intCast(sum)), .big);
+
                 return .{
                     .is_syn = true,
                     .is_fin = false,
                     .payload = &.{},
                     .reply_len = ihl + tcp_offset,
+                    .src_port = src_port,
+                    .dst_port = dst_port,
+                    .seq = seq,
+                    .ack = ack,
                 };
             }
 
@@ -56,6 +162,10 @@ pub const TcpEngine = struct {
                 .is_fin = is_fin,
                 .payload = payload,
                 .reply_len = 0,
+                .src_port = src_port,
+                .dst_port = dst_port,
+                .seq = seq,
+                .ack = ack,
             };
         } else if (version == 6) {
             if (packet.len < 60 or packet[6] != 6) return null;
@@ -65,6 +175,9 @@ pub const TcpEngine = struct {
             const is_syn = (flags & 0x02) != 0;
             const is_fin = (flags & 0x01) != 0;
             const seq = std.mem.readInt(u32, packet[ihl + 4 ..][0..4], .big);
+            const ack = std.mem.readInt(u32, packet[ihl + 8 ..][0..4], .big);
+            const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
+            const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
 
             if (is_syn) {
                 var src_ip: [16]u8 = undefined;
@@ -74,8 +187,6 @@ pub const TcpEngine = struct {
                 @memcpy(packet[8..24], &dst_ip);
                 @memcpy(packet[24..40], &src_ip);
 
-                const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
-                const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
                 std.mem.writeInt(u16, packet[ihl..][0..2], dst_port, .big);
                 std.mem.writeInt(u16, packet[ihl + 2 ..][0..2], src_port, .big);
 
@@ -100,6 +211,10 @@ pub const TcpEngine = struct {
                     .is_fin = false,
                     .payload = &.{},
                     .reply_len = ihl + tcp_offset,
+                    .src_port = src_port,
+                    .dst_port = dst_port,
+                    .seq = seq,
+                    .ack = ack,
                 };
             }
 
@@ -110,6 +225,10 @@ pub const TcpEngine = struct {
                 .is_fin = is_fin,
                 .payload = payload,
                 .reply_len = 0,
+                .src_port = src_port,
+                .dst_port = dst_port,
+                .seq = seq,
+                .ack = ack,
             };
         }
 

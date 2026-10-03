@@ -11,6 +11,7 @@ const udp_engine = @import("tun/udp_engine.zig");
 const dns_responder = @import("tun/dns_responder.zig");
 
 var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var global_dns: ?*fake_ip.FakeIpEngine = null;
 
 fn handleSig(sig: i32) callconv(.c) void {
     _ = sig;
@@ -146,6 +147,47 @@ fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
     }
 }
 
+fn forwardTcpStream(
+    tun_dev: @import("tun/device.zig").TunDevice,
+    fake_ip_bytes: [4]u8,
+    client_ip_bytes: [4]u8,
+    target_port: u16,
+    client_port: u16,
+    domain: []const u8,
+    remote_port: u16,
+    initial_payload: []const u8,
+    client_ack_seq: u32,
+) void {
+    const target_stream = std.net.tcpConnectToHost(std.heap.page_allocator, domain, remote_port) catch return;
+    defer target_stream.close();
+
+    target_stream.writeAll(initial_payload) catch return;
+
+    var server_seq: u32 = 0x10000001;
+    var resp_buf: [16384]u8 = undefined;
+    var tcp_pkt_buf: [16384 + 128]u8 = undefined;
+
+    while (!should_exit.load(.seq_cst)) {
+        const n = target_stream.read(&resp_buf) catch break;
+        if (n == 0) break;
+
+        const pkt_len = tcp_engine.buildTcpPacket(
+            fake_ip_bytes,
+            client_ip_bytes,
+            target_port,
+            client_port,
+            server_seq,
+            client_ack_seq,
+            0x18,
+            resp_buf[0..n],
+            &tcp_pkt_buf,
+        ) orelse break;
+
+        _ = tun_dev.writePacket(tcp_pkt_buf[0..pkt_len]) catch break;
+        server_seq += @intCast(n);
+    }
+}
+
 fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
     var packet_buf: [2048]u8 = undefined;
     while (!should_exit.load(.seq_cst)) {
@@ -158,6 +200,56 @@ fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
             } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
                 if (tcp_res.is_syn) {
                     _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
+                    std.log.info("User-Space TCP: SYN-ACK handshake generated.", .{});
+                } else if (tcp_res.payload.len > 0) {
+                    var ack_buf: [128]u8 = undefined;
+                    const client_ip = packet[12..16];
+                    const target_ip = packet[16..20];
+                    const ack_len = tcp_engine.buildTcpPacket(
+                        target_ip.*,
+                        client_ip.*,
+                        tcp_res.dst_port,
+                        tcp_res.src_port,
+                        0x10000001,
+                        tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len)),
+                        0x10,
+                        &.{},
+                        &ack_buf,
+                    );
+                    if (ack_len) |l| {
+                        _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
+                    }
+
+                    const target_u32 = std.mem.readInt(u32, target_ip, .big);
+                    var domain: []const u8 = "icanhazip.com";
+                    if (global_dns) |d| {
+                        if (d.lookup(target_u32)) |name| {
+                            domain = name;
+                        }
+                    }
+
+                    std.log.info("Forwarding TCP stream to {s}:{d} ({d} bytes)...", .{ domain, tcp_res.dst_port, tcp_res.payload.len });
+
+                    var fake_ip_copy: [4]u8 = undefined;
+                    var client_ip_copy: [4]u8 = undefined;
+                    @memcpy(&fake_ip_copy, target_ip);
+                    @memcpy(&client_ip_copy, client_ip);
+
+                    var payload_copy: [2048]u8 = undefined;
+                    @memcpy(payload_copy[0..tcp_res.payload.len], tcp_res.payload);
+
+                    const fw_thread = std.Thread.spawn(.{}, forwardTcpStream, .{
+                        tun_dev,
+                        fake_ip_copy,
+                        client_ip_copy,
+                        tcp_res.dst_port,
+                        tcp_res.src_port,
+                        domain,
+                        tcp_res.dst_port,
+                        payload_copy[0..tcp_res.payload.len],
+                        tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len)),
+                    }) catch null;
+                    if (fw_thread) |t| t.detach();
                 }
             }
         }
@@ -196,6 +288,7 @@ pub fn main() !void {
 
     var dns = fake_ip.FakeIpEngine.init(allocator);
     defer dns.deinit();
+    global_dns = &dns;
 
     const dns_thread = std.Thread.spawn(.{}, runDnsServer, .{&dns}) catch null;
     if (dns_thread) |t| t.detach();
