@@ -1,5 +1,6 @@
 const std = @import("std");
-const protocol = @import("../src/common/protocol.zig");
+const common = @import("common");
+const protocol = common.protocol;
 
 test "header encode decode" {
     const hdr = protocol.Header{

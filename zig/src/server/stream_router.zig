@@ -1,10 +1,11 @@
 const std = @import("std");
-const protocol = @import("../common/protocol.zig");
-const types = @import("../common/types.zig");
+const common = @import("common");
+const protocol = common.protocol;
+const types = common.types;
 
 pub const StreamSession = struct {
     stream_id: types.StreamId,
-    target_fd: ?std.os.fd_t = null,
+    target_fd: ?std.posix.fd_t = null,
     sent_offset: u64 = 0,
     ack_offset: u64 = 0,
     parked: bool = false,

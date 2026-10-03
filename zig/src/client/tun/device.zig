@@ -1,17 +1,18 @@
 const std = @import("std");
+const posix = std.posix;
 
 pub const TunDevice = struct {
-    fd: std.os.fd_t,
+    fd: posix.fd_t,
 
     pub fn readPacket(self: TunDevice, buf: []u8) !usize {
-        return std.os.read(self.fd, buf);
+        return posix.read(self.fd, buf);
     }
 
     pub fn writePacket(self: TunDevice, buf: []const u8) !usize {
-        return std.os.write(self.fd, buf);
+        return posix.write(self.fd, buf);
     }
 
     pub fn close(self: TunDevice) void {
-        std.os.close(self.fd);
+        posix.close(self.fd);
     }
 };

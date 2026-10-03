@@ -5,8 +5,8 @@ pub const KeyPair = struct {
     public_key: [32]u8,
     secret_key: [32]u8,
 
-    pub fn generate() !KeyPair {
-        const pair = try crypto.dh.X25519.KeyPair.create(null);
+    pub fn generate() KeyPair {
+        const pair = crypto.dh.X25519.KeyPair.generate();
         return .{
             .public_key = pair.public_key,
             .secret_key = pair.secret_key,

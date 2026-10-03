@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("../common/types.zig");
+const common = @import("common");
+const types = common.types;
 
 pub const HubConnection = struct {
     hub_id: u32,

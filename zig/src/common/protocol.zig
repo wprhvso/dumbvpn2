@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types.zig");
+pub const types = @import("types.zig");
 
 pub const FrameType = enum(u8) {
     connect = 0x01,

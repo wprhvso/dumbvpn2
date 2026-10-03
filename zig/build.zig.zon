@@ -1,6 +1,8 @@
 .{
-    .name = "dumbvpn-core",
+    .name = .dumbvpn_core,
     .version = "0.1.0",
+    .fingerprint = 0xcd5b6d144864b2f7,
+    .minimum_zig_version = "0.15.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",
