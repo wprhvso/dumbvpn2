@@ -110,12 +110,15 @@ pub const TcpEngine = struct {
                 @memcpy(packet[12..16], &dst_ip);
                 @memcpy(packet[16..20], &src_ip);
 
+                std.mem.writeInt(u16, packet[2..4], 40, .big);
+
                 std.mem.writeInt(u16, packet[ihl..][0..2], dst_port, .big);
                 std.mem.writeInt(u16, packet[ihl + 2 ..][0..2], src_port, .big);
 
                 std.mem.writeInt(u32, packet[ihl + 4 ..][0..4], 0x10000000, .big);
                 std.mem.writeInt(u32, packet[ihl + 8 ..][0..4], seq + 1, .big);
-                packet[ihl + 13] = 0x12; // SYN-ACK
+                packet[ihl + 12] = 0x50;
+                packet[ihl + 13] = 0x12;
                 std.mem.writeInt(u16, packet[ihl + 14 ..][0..2], 65535, .big);
 
                 packet[10] = 0;
@@ -132,10 +135,10 @@ pub const TcpEngine = struct {
                     sum += std.mem.readInt(u16, packet[j..][0..2], .big);
                 }
                 sum += 6;
-                sum += @as(u32, @intCast(tcp_offset));
+                sum += 20;
 
                 j = ihl;
-                while (j + 1 < ihl + tcp_offset) : (j += 2) {
+                while (j < ihl + 20) : (j += 2) {
                     sum += std.mem.readInt(u16, packet[j..][0..2], .big);
                 }
                 while ((sum >> 16) != 0) {
@@ -147,7 +150,7 @@ pub const TcpEngine = struct {
                     .is_syn = true,
                     .is_fin = false,
                     .payload = &.{},
-                    .reply_len = ihl + tcp_offset,
+                    .reply_len = 40,
                     .src_port = src_port,
                     .dst_port = dst_port,
                     .seq = seq,
@@ -187,30 +190,35 @@ pub const TcpEngine = struct {
                 @memcpy(packet[8..24], &dst_ip);
                 @memcpy(packet[24..40], &src_ip);
 
+                std.mem.writeInt(u16, packet[4..6], 20, .big);
+
                 std.mem.writeInt(u16, packet[ihl..][0..2], dst_port, .big);
                 std.mem.writeInt(u16, packet[ihl + 2 ..][0..2], src_port, .big);
 
                 std.mem.writeInt(u32, packet[ihl + 4 ..][0..4], 0x20000000, .big);
                 std.mem.writeInt(u32, packet[ihl + 8 ..][0..4], seq + 1, .big);
+                packet[ihl + 12] = 0x50;
                 packet[ihl + 13] = 0x12;
                 std.mem.writeInt(u16, packet[ihl + 14 ..][0..2], 65535, .big);
 
                 packet[ihl + 16] = 0;
                 packet[ihl + 17] = 0;
 
-                var sum = ip_checksum.calculateIpv6PseudoChecksum(&dst_ip, &src_ip, 6, @intCast(tcp_offset));
-                var i: usize = ihl;
-                while (i + 1 < ihl + tcp_offset) : (i += 2) {
-                    sum += std.mem.readInt(u16, packet[i..][0..2], .big);
+                var sum = ip_checksum.calculateIpv6PseudoChecksum(&dst_ip, &src_ip, 6, 20);
+                var j: usize = ihl;
+                while (j < ihl + 20) : (j += 2) {
+                    sum += std.mem.readInt(u16, packet[j..][0..2], .big);
                 }
-                while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+                while ((sum >> 16) != 0) {
+                    sum = (sum & 0xFFFF) + (sum >> 16);
+                }
                 std.mem.writeInt(u16, packet[ihl + 16 ..][0..2], ~@as(u16, @intCast(sum)), .big);
 
                 return .{
                     .is_syn = true,
                     .is_fin = false,
                     .payload = &.{},
-                    .reply_len = ihl + tcp_offset,
+                    .reply_len = 60,
                     .src_port = src_port,
                     .dst_port = dst_port,
                     .seq = seq,
