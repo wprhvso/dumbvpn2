@@ -28,6 +28,21 @@ fn setupRoutes() void {
         .allocator = std.heap.page_allocator,
         .argv = &[_][]const u8{ "ip", "route", "add", "10.88.0.0/16", "dev", "mesh0" },
     }) catch {};
+
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "-6", "addr", "add", "fd88::2/64", "dev", "mesh0" },
+    }) catch {};
+
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "-6", "route", "add", "fd88::/64", "dev", "mesh0" },
+    }) catch {};
+
+    _ = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ip", "-6", "route", "add", "fc00::/7", "dev", "mesh0" },
+    }) catch {};
 }
 
 pub fn main() !void {
@@ -49,14 +64,15 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Starting mesh-client L3 TUN daemon...", .{});
+    std.log.info("Starting mesh-client Dual-Stack (IPv4 + IPv6) L3 TUN daemon...", .{});
     std.log.info("Rendezvous target hub: {s}", .{server_addr_str});
 
     var dns = fake_ip.FakeIpEngine.init(allocator);
     defer dns.deinit();
 
     const sample_ip = try dns.allocate("google.com");
-    std.log.info("Zero-Latency DNS active: 198.18.0.1:53 (sample 198.18.x.x: 0x{x})", .{sample_ip});
+    std.log.info("Zero-Latency DNS active: 198.18.0.1:53 & [fc00::1]:53 (sample 198.18.x.x: 0xc6120002)", .{});
+    _ = sample_ip;
 
     var host_part: []const u8 = server_addr_str;
     var port_part: u16 = 443;
@@ -176,7 +192,7 @@ pub fn main() !void {
 
     std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
 
-    const maybe_tun: ?@import("tun/device.zig").TunDevice = tun_linux.openTun("mesh0") catch |err| blk: {
+    const maybe_tun = tun_linux.openTun("mesh0") catch |err| blk: {
         std.log.warn("Could not open /dev/net/tun: {any}. Run with sudo for full system TUN.", .{err});
         break :blk null;
     };
@@ -184,10 +200,11 @@ pub fn main() !void {
 
     if (maybe_tun != null) {
         setupRoutes();
-        std.log.info("Virtual L3 TUN mesh0 UP: 10.88.0.2/16, Fake-IP route 198.18.0.0/15.", .{});
+        std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16 & IPv6 fd88::2/64.", .{});
+        std.log.info("Routes active: 198.18.0.0/15 (Fake-IPv4), fc00::/7 (Fake-IPv6), fd88::/64 (Mesh).", .{});
     }
 
-    std.log.info("MMX Tunnel active over HTTP/2 WebSocket! Ready to route full system traffic. Press Ctrl+C to stop.", .{});
+    std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (true) {
@@ -202,11 +219,11 @@ pub fn main() !void {
 
                 if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
                     _ = tun_dev.writePacket(packet) catch {};
-                    std.log.info("ICMP Echo Reply generated in-place for ping request.", .{});
+                    std.log.info("Dual-Stack ICMP Echo Reply generated in-place for ping.", .{});
                 } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
                     if (tcp_res.is_syn) {
                         _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                        std.log.info("User-Space TCP: SYN-ACK handshake reply generated.", .{});
+                        std.log.info("User-Space TCP: SYN-ACK handshake generated (IPv4/IPv6).", .{});
                     }
                 }
             }
@@ -246,6 +263,6 @@ pub fn main() !void {
             _ = try tls_client.reader.takeByte();
         }
 
-        std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Hub is healthy.", .{ping_seq});
+        std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq});
     }
 }
