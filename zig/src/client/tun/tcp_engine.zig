@@ -75,16 +75,22 @@ pub fn buildTcpPacket(
 }
 
 pub const TcpEngine = struct {
-    pub fn handlePacket(packet: []u8) ?struct {
+    pub const PacketResult = struct {
         is_syn: bool,
         is_fin: bool,
-        payload: []const u8,
-        reply_len: usize,
+        is_rst: bool,
+        is_ack: bool,
+        src_ip: [4]u8,
+        dst_ip: [4]u8,
         src_port: u16,
         dst_port: u16,
         seq: u32,
         ack: u32,
-    } {
+        payload: []const u8,
+        reply_len: usize,
+    };
+
+    pub fn handlePacket(packet: []u8) ?PacketResult {
         if (packet.len < 40) return null;
         const version = packet[0] >> 4;
 
@@ -96,19 +102,22 @@ pub const TcpEngine = struct {
             const flags = packet[ihl + 13];
             const is_syn = (flags & 0x02) != 0;
             const is_fin = (flags & 0x01) != 0;
+            const is_rst = (flags & 0x04) != 0;
+            const is_ack = (flags & 0x10) != 0;
             const seq = std.mem.readInt(u32, packet[ihl + 4 ..][0..4], .big);
             const ack = std.mem.readInt(u32, packet[ihl + 8 ..][0..4], .big);
 
             const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
             const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
 
+            var orig_src_ip: [4]u8 = undefined;
+            var orig_dst_ip: [4]u8 = undefined;
+            @memcpy(&orig_src_ip, packet[12..16]);
+            @memcpy(&orig_dst_ip, packet[16..20]);
+
             if (is_syn) {
-                var src_ip: [4]u8 = undefined;
-                var dst_ip: [4]u8 = undefined;
-                @memcpy(&src_ip, packet[12..16]);
-                @memcpy(&dst_ip, packet[16..20]);
-                @memcpy(packet[12..16], &dst_ip);
-                @memcpy(packet[16..20], &src_ip);
+                @memcpy(packet[12..16], &orig_dst_ip);
+                @memcpy(packet[16..20], &orig_src_ip);
 
                 std.mem.writeInt(u16, packet[2..4], 40, .big);
 
@@ -149,12 +158,16 @@ pub const TcpEngine = struct {
                 return .{
                     .is_syn = true,
                     .is_fin = false,
-                    .payload = &.{},
-                    .reply_len = 40,
+                    .is_rst = false,
+                    .is_ack = is_ack,
+                    .src_ip = orig_src_ip,
+                    .dst_ip = orig_dst_ip,
                     .src_port = src_port,
                     .dst_port = dst_port,
                     .seq = seq,
                     .ack = ack,
+                    .payload = &.{},
+                    .reply_len = 40,
                 };
             }
 
@@ -163,12 +176,16 @@ pub const TcpEngine = struct {
             return .{
                 .is_syn = false,
                 .is_fin = is_fin,
-                .payload = payload,
-                .reply_len = 0,
+                .is_rst = is_rst,
+                .is_ack = is_ack,
+                .src_ip = orig_src_ip,
+                .dst_ip = orig_dst_ip,
                 .src_port = src_port,
                 .dst_port = dst_port,
                 .seq = seq,
                 .ack = ack,
+                .payload = payload,
+                .reply_len = 0,
             };
         } else if (version == 6) {
             if (packet.len < 60 or packet[6] != 6) return null;
@@ -177,18 +194,20 @@ pub const TcpEngine = struct {
             const flags = packet[ihl + 13];
             const is_syn = (flags & 0x02) != 0;
             const is_fin = (flags & 0x01) != 0;
+            const is_rst = (flags & 0x04) != 0;
+            const is_ack = (flags & 0x10) != 0;
             const seq = std.mem.readInt(u32, packet[ihl + 4 ..][0..4], .big);
             const ack = std.mem.readInt(u32, packet[ihl + 8 ..][0..4], .big);
             const src_port = std.mem.readInt(u16, packet[ihl..][0..2], .big);
             const dst_port = std.mem.readInt(u16, packet[ihl + 2 ..][0..2], .big);
 
             if (is_syn) {
-                var src_ip: [16]u8 = undefined;
-                var dst_ip: [16]u8 = undefined;
-                @memcpy(&src_ip, packet[8..24]);
-                @memcpy(&dst_ip, packet[24..40]);
-                @memcpy(packet[8..24], &dst_ip);
-                @memcpy(packet[24..40], &src_ip);
+                var src_ip6: [16]u8 = undefined;
+                var dst_ip6: [16]u8 = undefined;
+                @memcpy(&src_ip6, packet[8..24]);
+                @memcpy(&dst_ip6, packet[24..40]);
+                @memcpy(packet[8..24], &dst_ip6);
+                @memcpy(packet[24..40], &src_ip6);
 
                 std.mem.writeInt(u16, packet[4..6], 20, .big);
 
@@ -204,7 +223,7 @@ pub const TcpEngine = struct {
                 packet[ihl + 16] = 0;
                 packet[ihl + 17] = 0;
 
-                var sum = ip_checksum.calculateIpv6PseudoChecksum(&dst_ip, &src_ip, 6, 20);
+                var sum = ip_checksum.calculateIpv6PseudoChecksum(&dst_ip6, &src_ip6, 6, 20);
                 var j: usize = ihl;
                 while (j < ihl + 20) : (j += 2) {
                     sum += std.mem.readInt(u16, packet[j..][0..2], .big);
@@ -217,12 +236,16 @@ pub const TcpEngine = struct {
                 return .{
                     .is_syn = true,
                     .is_fin = false,
-                    .payload = &.{},
-                    .reply_len = 60,
+                    .is_rst = false,
+                    .is_ack = is_ack,
+                    .src_ip = [4]u8{ 0, 0, 0, 0 },
+                    .dst_ip = [4]u8{ 0, 0, 0, 0 },
                     .src_port = src_port,
                     .dst_port = dst_port,
                     .seq = seq,
                     .ack = ack,
+                    .payload = &.{},
+                    .reply_len = 60,
                 };
             }
 
@@ -231,12 +254,16 @@ pub const TcpEngine = struct {
             return .{
                 .is_syn = false,
                 .is_fin = is_fin,
-                .payload = payload,
-                .reply_len = 0,
+                .is_rst = is_rst,
+                .is_ack = is_ack,
+                .src_ip = [4]u8{ 0, 0, 0, 0 },
+                .dst_ip = [4]u8{ 0, 0, 0, 0 },
                 .src_port = src_port,
                 .dst_port = dst_port,
                 .seq = seq,
                 .ack = ack,
+                .payload = payload,
+                .reply_len = 0,
             };
         }
 

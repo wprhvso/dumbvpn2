@@ -41,3 +41,55 @@ pub const Header = extern struct {
         };
     }
 };
+
+pub const FrameParser = struct {
+    buffer: [65536]u8 = undefined,
+    start: usize = 0,
+    len: usize = 0,
+
+    pub fn init() FrameParser {
+        return .{};
+    }
+
+    pub fn getWriteSlice(self: *FrameParser) []u8 {
+        if (self.start > 0 and self.len > 0) {
+            std.mem.copyForwards(u8, self.buffer[0..self.len], self.buffer[self.start .. self.start + self.len]);
+            self.start = 0;
+        } else if (self.len == 0) {
+            self.start = 0;
+        }
+        return self.buffer[self.len..];
+    }
+
+    pub fn append(self: *FrameParser, bytes: []const u8) !void {
+        const dest = self.getWriteSlice();
+        if (bytes.len > dest.len) return error.BufferOverflow;
+        @memcpy(dest[0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    pub fn advance(self: *FrameParser, bytes_read: usize) void {
+        self.len += bytes_read;
+    }
+
+    pub const Frame = struct {
+        header: Header,
+        payload: []const u8,
+    };
+
+    pub fn next(self: *FrameParser) ?Frame {
+        if (self.len < 8) return null;
+        const hdr_slice: *const [8]u8 = @ptrCast(self.buffer[self.start .. self.start + 8]);
+        const hdr = Header.decode(hdr_slice);
+        const total = 8 + @as(usize, hdr.length);
+        if (self.len < total) return null;
+
+        const payload = self.buffer[self.start + 8 .. self.start + total];
+        self.start += total;
+        self.len -= total;
+        return .{
+            .header = hdr,
+            .payload = payload,
+        };
+    }
+};

@@ -11,40 +11,49 @@ static_resources:
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
           common_tls_context:
-            alpn_protocols: ["h2", "http/1.1"]
+            alpn_protocols:
+            - h2
+            - http/1.1
+            tls_certificates:
+            - certificate_chain:
+                filename: /etc/envoy/certs/server.crt
+              private_key:
+                filename: /etc/envoy/certs/server.key
       filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: ingress_http
+          stat_prefix: ingress_https
           http2_protocol_options:
             allow_connect: true
           upgrade_configs:
-          - upgrade_type: "websocket"
+          - upgrade_type: websocket
           route_config:
             name: local_route
             virtual_hosts:
-            - name: backend
+            - name: mesh_backend
               domains: ["*"]
               routes:
               - match:
-                  prefix: "/api/v2/stream"
+                  prefix: "/"
                 route:
-                  cluster: zig_mesh_server
+                  cluster: mesh_server_backend
+                  timeout: 0s
           http_filters:
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
-  - name: zig_mesh_server
+  - name: mesh_server_backend
     connect_timeout: 0.25s
     type: STATIC
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: zig_mesh_server
+      cluster_name: mesh_server_backend
       endpoints:
       - lb_endpoints:
         - endpoint:
             address:
-              pipe:
-                path: "{{ socket_path }}"
+              socket_address:
+                address: 127.0.0.1
+                port_value: {{ mesh_server_port }}

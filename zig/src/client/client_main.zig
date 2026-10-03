@@ -2,7 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("common");
 const protocol = common.protocol;
-const fake_ip = @import("fake_ip.zig");
+const fake_ip_module = @import("fake_ip.zig");
+const flow_table_mod = @import("flow_table.zig");
 const h2 = @import("h2.zig");
 const tun_linux = @import("tun/tun_linux.zig");
 const icmp_engine = @import("tun/icmp_engine.zig");
@@ -11,15 +12,10 @@ const udp_engine = @import("tun/udp_engine.zig");
 const dns_responder = @import("tun/dns_responder.zig");
 
 var should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var global_dns: ?*fake_ip.FakeIpEngine = null;
+var global_dns: ?*fake_ip_module.FakeIpEngine = null;
 
-var active_fake_ip = [4]u8{ 198, 18, 0, 3 };
-var active_client_ip = [4]u8{ 10, 88, 0, 2 };
-var active_client_port: u16 = 0;
-var active_target_port: u16 = 443;
-var active_server_seq: u32 = 0x10000001;
-var active_client_seq: u32 = 0;
 var writer_mutex: std.Thread.Mutex = .{};
+var tun_mutex: std.Thread.Mutex = .{};
 
 fn handleSig(sig: i32) callconv(.c) void {
     _ = sig;
@@ -121,7 +117,7 @@ fn teardownRoutes() void {
     }) catch {};
 }
 
-fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
+fn runDnsServer(engine: *fake_ip_module.FakeIpEngine) void {
     const addr = std.net.Address.parseIp4("0.0.0.0", 53) catch return;
     const socket = posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return;
     defer posix.close(socket);
@@ -155,55 +151,120 @@ fn runDnsServer(engine: *fake_ip.FakeIpEngine) void {
     }
 }
 
-fn runTunnelReader(tun_dev: @import("tun/device.zig").TunDevice, reader: anytype) void {
-    var raw_hdr: [9]u8 = undefined;
-    var data_buf: [16384]u8 = undefined;
+fn writeTunnelFrameH2(
+    writer: anytype,
+    stream_writer: anytype,
+    mutex: *std.Thread.Mutex,
+    stream_id: u32,
+    frame_type: protocol.FrameType,
+    flags: u8,
+    payload: []const u8,
+) void {
+    var mmx_hdr_buf: [8]u8 = undefined;
+    const mmx_hdr = protocol.Header{
+        .stream_id = stream_id,
+        .frame_type = frame_type,
+        .flags = flags,
+        .length = @intCast(payload.len),
+    };
+    mmx_hdr.encode(&mmx_hdr_buf);
+
+    var h2_hdr_buf: [9]u8 = undefined;
+    const h2_hdr = h2.FrameHeader{
+        .length = 8 + payload.len,
+        .frame_type = .data,
+        .flags = 0x00,
+        .stream_id = 1,
+    };
+    h2_hdr.encode(&h2_hdr_buf);
+
+    mutex.lock();
+    defer mutex.unlock();
+    writer.writeAll(&h2_hdr_buf) catch return;
+    writer.writeAll(&mmx_hdr_buf) catch return;
+    if (payload.len > 0) {
+        writer.writeAll(payload) catch return;
+    }
+    writer.flush() catch return;
+    stream_writer.flush() catch return;
+}
+
+fn runTunnelReader(
+    tun_dev: @import("tun/device.zig").TunDevice,
+    reader: anytype,
+    flow_table: *flow_table_mod.FlowTable,
+    tun_mtx: *std.Thread.Mutex,
+) void {
+    var parser = protocol.FrameParser.init();
     var tcp_pkt_buf: [16384 + 128]u8 = undefined;
 
     while (!should_exit.load(.seq_cst)) {
+        var raw_hdr: [9]u8 = undefined;
         for (&raw_hdr) |*b| {
             b.* = reader.takeByte() catch return;
         }
         const frame = h2.FrameHeader.decode(&raw_hdr);
 
         if (frame.frame_type == .data and frame.stream_id == 1) {
-            const len = @min(frame.length, data_buf.len);
             var i: usize = 0;
             while (i < frame.length) : (i += 1) {
                 const b = reader.takeByte() catch return;
-                if (i < len) data_buf[i] = b;
-            }
-            if (len == 0) continue;
-
-            var payload = data_buf[0..len];
-            if (payload.len >= 2 and payload[0] == 0x82) {
-                var offset: usize = 2;
-                if (payload[1] == 126) {
-                    offset = 4;
-                } else if (payload[1] == 127) {
-                    offset = 10;
-                }
-                if (payload.len >= offset) {
-                    payload = payload[offset..];
+                const dest = parser.getWriteSlice();
+                if (dest.len > 0) {
+                    dest[0] = b;
+                    parser.advance(1);
                 }
             }
-            if (payload.len == 0) continue;
 
-            const pkt_len = tcp_engine.buildTcpPacket(
-                active_fake_ip,
-                active_client_ip,
-                active_target_port,
-                active_client_port,
-                active_server_seq,
-                active_client_seq,
-                0x18,
-                payload,
-                &tcp_pkt_buf,
-            );
-            if (pkt_len) |l| {
-                _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
-                active_server_seq += @intCast(payload.len);
-                std.log.info("Hub response: delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{payload.len});
+            while (parser.next()) |mmx_frame| {
+                if (mmx_frame.header.frame_type == .data) {
+                    if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
+                        const pkt_len = tcp_engine.buildTcpPacket(
+                            flow.fake_ip,
+                            flow.client_ip,
+                            flow.target_port,
+                            flow.client_port,
+                            flow.server_seq,
+                            flow.client_seq,
+                            0x18,
+                            mmx_frame.payload,
+                            &tcp_pkt_buf,
+                        );
+                        if (pkt_len) |l| {
+                            tun_mtx.lock();
+                            _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
+                            tun_mtx.unlock();
+
+                            flow.server_seq += @intCast(mmx_frame.payload.len);
+                            std.log.info("Hub response: flow {d} ({s}:{d}) delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{
+                                flow.stream_id,
+                                flow.getDomain(),
+                                flow.target_port,
+                                mmx_frame.payload.len,
+                            });
+                        }
+                    }
+                } else if (mmx_frame.header.frame_type == .close) {
+                    if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
+                        const pkt_len = tcp_engine.buildTcpPacket(
+                            flow.fake_ip,
+                            flow.client_ip,
+                            flow.target_port,
+                            flow.client_port,
+                            flow.server_seq,
+                            flow.client_seq,
+                            0x11,
+                            &.{},
+                            &tcp_pkt_buf,
+                        );
+                        if (pkt_len) |l| {
+                            tun_mtx.lock();
+                            _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
+                            tun_mtx.unlock();
+                        }
+                        flow_table.remove(mmx_frame.header.stream_id);
+                    }
+                }
             }
         } else {
             var i: usize = 0;
@@ -244,9 +305,12 @@ pub fn main() !void {
     std.log.info("Starting mesh-client Dual-Stack (IPv4 + IPv6) L3 TUN daemon...", .{});
     std.log.info("Rendezvous target hub: {s}", .{server_addr_str});
 
-    var dns = fake_ip.FakeIpEngine.init(allocator);
+    var dns = fake_ip_module.FakeIpEngine.init(allocator);
     defer dns.deinit();
     global_dns = &dns;
+
+    var flow_table = flow_table_mod.FlowTable.init(allocator);
+    defer flow_table.deinit();
 
     const dns_thread = std.Thread.spawn(.{}, runDnsServer, .{&dns}) catch null;
     if (dns_thread) |t| t.detach();
@@ -360,7 +424,31 @@ pub fn main() !void {
             try tls_client.writer.flush();
             try stream_writer.interface.flush();
         } else if (frame.frame_type == .headers and frame.stream_id == 1) {
-            stream1_open = true;
+            var headers_payload: [512]u8 = undefined;
+            const hlen = @min(frame.length, headers_payload.len);
+            for (headers_payload[0..hlen]) |*b| {
+                b.* = try tls_client.reader.takeByte();
+            }
+            var rem = frame.length - hlen;
+            while (rem > 0) : (rem -= 1) {
+                _ = try tls_client.reader.takeByte();
+            }
+
+            var status_ok = false;
+            for (headers_payload[0..hlen]) |b| {
+                if (b == 0x88) {
+                    status_ok = true;
+                    break;
+                }
+            }
+            if (status_ok or hlen > 0) {
+                std.log.info("HTTP/2 stream 1 established with status 200 OK (flags: 0x{x})", .{frame.flags});
+                stream1_open = true;
+            } else {
+                std.log.err("HTTP/2 stream 1 handshake returned error status!", .{});
+                return;
+            }
+            continue;
         }
 
         var i: usize = 0;
@@ -384,7 +472,12 @@ pub fn main() !void {
     if (maybe_tun != null) {
         setupRoutes();
         resolv_guard.capture();
-        const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{ maybe_tun.?, &tls_client.reader }) catch null;
+        const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{
+            maybe_tun.?,
+            &tls_client.reader,
+            &flow_table,
+            &tun_mutex,
+        }) catch null;
         if (reader_t) |t| t.detach();
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
@@ -403,11 +496,15 @@ pub fn main() !void {
                 const packet = packet_buf[0..read_res];
 
                 if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+                    tun_mutex.lock();
                     _ = tun_dev.writePacket(packet) catch {};
+                    tun_mutex.unlock();
                 } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
-                    const client_ip = packet[12..16];
-                    const target_ip = packet[16..20];
-                    const target_u32 = std.mem.readInt(u32, target_ip, .big);
+                    const client_ip = tcp_res.src_ip;
+                    const fake_ip = tcp_res.dst_ip;
+                    const client_port = tcp_res.src_port;
+                    const target_port = tcp_res.dst_port;
+                    const target_u32 = std.mem.readInt(u32, &fake_ip, .big);
 
                     var domain: []const u8 = "icanhazip.com";
                     if (global_dns) |d| {
@@ -417,74 +514,94 @@ pub fn main() !void {
                     }
 
                     if (tcp_res.is_syn) {
-                        active_client_port = tcp_res.src_port;
-                        active_target_port = tcp_res.dst_port;
-                        active_fake_ip = target_ip.*;
-                        active_client_ip = client_ip.*;
-                        active_client_seq = tcp_res.seq + 1;
-                        active_server_seq = 0x10000001;
+                        const flow = flow_table.getOrCreate(
+                            client_ip,
+                            fake_ip,
+                            client_port,
+                            target_port,
+                            domain,
+                            tcp_res.seq,
+                        ) catch continue;
 
+                        tun_mutex.lock();
                         _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                        std.log.info("User-Space TCP: SYN-ACK handshake generated for {s}:{d} (flow port {d}).", .{ domain, tcp_res.dst_port, tcp_res.src_port });
+                        tun_mutex.unlock();
+
+                        std.log.info("User-Space TCP: SYN-ACK handshake generated for {s}:{d} (flow {d}, port {d}).", .{
+                            domain,
+                            target_port,
+                            flow.stream_id,
+                            client_port,
+                        });
 
                         var connect_payload: [512]u8 = undefined;
-                        std.mem.writeInt(u32, connect_payload[0..4], 1, .big);
-                        connect_payload[4] = 0x01; // CONNECT
-                        connect_payload[5] = 0x00;
-                        const p_len = 1 + 1 + domain.len + 2;
-                        std.mem.writeInt(u16, connect_payload[6..8], @intCast(p_len), .big);
-                        connect_payload[8] = 0x02; // Domain
-                        connect_payload[9] = @intCast(domain.len);
-                        @memcpy(connect_payload[10 .. 10 + domain.len], domain);
-                        std.mem.writeInt(u16, connect_payload[10 + domain.len ..][0..2], tcp_res.dst_port, .big);
+                        connect_payload[0] = 0x02; // Domain
+                        connect_payload[1] = @intCast(domain.len);
+                        @memcpy(connect_payload[2 .. 2 + domain.len], domain);
+                        std.mem.writeInt(u16, connect_payload[2 + domain.len ..][0..2], target_port, .big);
+                        const c_len = 2 + domain.len + 2;
 
-                        const data_frame = h2.FrameHeader{
-                            .length = 8 + p_len,
-                            .frame_type = .data,
-                            .flags = 0x00,
-                            .stream_id = 1,
-                        };
-                        data_frame.encode(&hdr_buf);
-                        writer_mutex.lock();
-                        tls_client.writer.writeAll(&hdr_buf) catch {};
-                        tls_client.writer.writeAll(connect_payload[0 .. 8 + p_len]) catch {};
-                        tls_client.writer.flush() catch {};
-                        stream_writer.interface.flush() catch {};
-                        writer_mutex.unlock();
-                        std.log.info("Sent MMX CONNECT for {s}:{d} over HTTP/2 Stream 1!", .{ domain, tcp_res.dst_port });
-                    } else if (tcp_res.payload.len > 0) {
-                        active_client_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
-
-                        var ack_buf: [128]u8 = undefined;
-                        const ack_len = tcp_engine.buildTcpPacket(
-                            target_ip.*,
-                            client_ip.*,
-                            tcp_res.dst_port,
-                            tcp_res.src_port,
-                            active_server_seq,
-                            active_client_seq,
-                            0x10,
-                            &.{},
-                            &ack_buf,
+                        writeTunnelFrameH2(
+                            &tls_client.writer,
+                            &stream_writer.interface,
+                            &writer_mutex,
+                            flow.stream_id,
+                            .connect,
+                            0,
+                            connect_payload[0..c_len],
                         );
-                        if (ack_len) |l| {
-                            _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
-                        }
+                        std.log.info("Sent MMX CONNECT for flow {d} ({s}:{d}) over HTTP/2 Stream 1!", .{ flow.stream_id, domain, target_port });
+                    } else if (tcp_res.payload.len > 0) {
+                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                            flow.client_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
 
-                        const data_frame = h2.FrameHeader{
-                            .length = tcp_res.payload.len,
-                            .frame_type = .data,
-                            .flags = 0x00,
-                            .stream_id = 1,
-                        };
-                        data_frame.encode(&hdr_buf);
-                        writer_mutex.lock();
-                        tls_client.writer.writeAll(&hdr_buf) catch {};
-                        tls_client.writer.writeAll(tcp_res.payload) catch {};
-                        tls_client.writer.flush() catch {};
-                        stream_writer.interface.flush() catch {};
-                        writer_mutex.unlock();
-                        std.log.info("Streamed {d} bytes to {s}:{d} over HTTP/2!", .{ tcp_res.payload.len, domain, tcp_res.dst_port });
+                            var ack_buf: [128]u8 = undefined;
+                            const ack_len = tcp_engine.buildTcpPacket(
+                                flow.fake_ip,
+                                flow.client_ip,
+                                flow.target_port,
+                                flow.client_port,
+                                flow.server_seq,
+                                flow.client_seq,
+                                0x10,
+                                &.{},
+                                &ack_buf,
+                            );
+                            if (ack_len) |l| {
+                                tun_mutex.lock();
+                                _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
+                                tun_mutex.unlock();
+                            }
+
+                            writeTunnelFrameH2(
+                                &tls_client.writer,
+                                &stream_writer.interface,
+                                &writer_mutex,
+                                flow.stream_id,
+                                .data,
+                                0,
+                                tcp_res.payload,
+                            );
+                            std.log.info("Streamed {d} bytes for flow {d} to {s}:{d} over HTTP/2!", .{ tcp_res.payload.len, flow.stream_id, flow.getDomain(), target_port });
+                        }
+                    } else if (tcp_res.is_fin or tcp_res.is_rst) {
+                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                            writeTunnelFrameH2(
+                                &tls_client.writer,
+                                &stream_writer.interface,
+                                &writer_mutex,
+                                flow.stream_id,
+                                .close,
+                                if (tcp_res.is_fin) protocol.Flags.FIN else protocol.Flags.RST,
+                                &.{},
+                            );
+                            flow_table.remove(flow.stream_id);
+                        }
+                    } else if (tcp_res.is_ack) {
+                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                            flow.established = true;
+                            flow.client_seq = tcp_res.seq;
+                        }
                     }
                 }
             }
@@ -492,19 +609,15 @@ pub fn main() !void {
 
         ping_seq += 1;
         if (ping_seq % 250 == 0) {
-            const ping_hdr = h2.FrameHeader{
-                .length = 8,
-                .frame_type = .ping,
-                .flags = 0x00,
-                .stream_id = 0,
-            };
-            ping_hdr.encode(&hdr_buf);
-            writer_mutex.lock();
-            tls_client.writer.writeAll(&hdr_buf) catch {};
-            tls_client.writer.writeAll("PINGPING") catch {};
-            tls_client.writer.flush() catch {};
-            stream_writer.interface.flush() catch {};
-            writer_mutex.unlock();
+            writeTunnelFrameH2(
+                &tls_client.writer,
+                &stream_writer.interface,
+                &writer_mutex,
+                0,
+                .ping,
+                0,
+                &.{},
+            );
             std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq / 250});
         }
     }

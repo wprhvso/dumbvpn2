@@ -1,0 +1,5 @@
+- name: restart mesh_server
+  ansible.builtin.systemd:
+    name: mesh-server
+    state: restarted
+    daemon_reload: true
