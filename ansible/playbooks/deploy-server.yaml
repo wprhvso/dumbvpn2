@@ -1,0 +1,4 @@
+- hosts: hubs
+  become: true
+  roles:
+    - mesh_server

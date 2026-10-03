@@ -1,0 +1,3 @@
+envoy_port: 443
+mesh_server_port: 4000
+socket_path: "/run/mesh-server/ws.sock"

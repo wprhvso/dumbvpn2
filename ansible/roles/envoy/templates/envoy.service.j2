@@ -1,0 +1,12 @@
+[Unit]
+Description=Envoy Proxy Gateway
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/envoy -c /etc/envoy/envoy.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+- name: Deploy mesh-server binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../zig/zig-out/bin/mesh-server"
+    dest: /usr/local/bin/mesh-server
+    mode: '0755'
+
+- name: Deploy mesh-server systemd service
+  ansible.builtin.template:
+    src: mesh-server.service.j2
+    dest: /etc/systemd/system/mesh-server.service
+    mode: '0644'
+  notify: restart mesh_server

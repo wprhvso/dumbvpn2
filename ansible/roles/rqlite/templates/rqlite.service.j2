@@ -1,0 +1,12 @@
+[Unit]
+Description=rqlite distributed SQLite engine
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/default/rqlite
+ExecStart=/usr/local/bin/rqlited -node-id=%H -http-addr=0.0.0.0:{{ rqlite_http_port }} -raft-addr=0.0.0.0:{{ rqlite_cluster_port }} /var/lib/rqlite
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

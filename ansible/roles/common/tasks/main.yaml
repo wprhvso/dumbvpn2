@@ -1,0 +1,18 @@
+- name: Apply sysctl network optimizations
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: true
+  loop:
+    - { key: 'net.core.default_qdisc', value: 'fq' }
+    - { key: 'net.ipv4.tcp_congestion_control', value: 'bbr' }
+    - { key: 'net.ipv4.ip_forward', value: '1' }
+
+- name: Install base dependencies
+  ansible.builtin.package:
+    name:
+      - curl
+      - ufw
+      - ca-certificates
+    state: present

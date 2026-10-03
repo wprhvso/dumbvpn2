@@ -1,0 +1,7 @@
+- hosts: hubs
+  become: true
+  roles:
+    - common
+    - envoy
+    - rqlite
+    - mesh_server

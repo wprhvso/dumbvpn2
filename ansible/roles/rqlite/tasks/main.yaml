@@ -1,0 +1,11 @@
+- name: Deploy rqlite environment
+  ansible.builtin.template:
+    src: rqlite.env.j2
+    dest: /etc/default/rqlite
+    mode: '0600'
+
+- name: Deploy rqlite service
+  ansible.builtin.template:
+    src: rqlite.service.j2
+    dest: /etc/systemd/system/rqlite.service
+    mode: '0644'

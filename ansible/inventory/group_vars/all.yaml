@@ -1,0 +1,5 @@
+mesh_subnet: "10.88.0.0/16"
+fake_ip_subnet: "198.18.0.0/15"
+rqlite_cluster_port: 4002
+rqlite_http_port: 4001
+s3_backup_bucket: "mesh-wal-backups"

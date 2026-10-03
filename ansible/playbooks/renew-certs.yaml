@@ -1,0 +1,7 @@
+- hosts: hubs
+  become: true
+  tasks:
+    - name: Renew TLS certs
+      ansible.builtin.command:
+        cmd: certbot renew --quiet
+      notify: restart envoy
