@@ -154,21 +154,85 @@ fn forwardTcpStream(
     target_port: u16,
     client_port: u16,
     domain: []const u8,
-    remote_port: u16,
     initial_payload: []const u8,
     client_ack_seq: u32,
+    hub_host: []const u8,
+    hub_port: u16,
 ) void {
-    const target_stream = std.net.tcpConnectToHost(std.heap.page_allocator, domain, remote_port) catch return;
-    defer target_stream.close();
+    const hub_addr = std.net.Address.parseIp4(hub_host, hub_port) catch return;
+    const hub_tcp = std.net.tcpConnectToAddress(hub_addr) catch return;
+    defer hub_tcp.close();
 
-    target_stream.writeAll(initial_payload) catch return;
+    const min_len = std.crypto.tls.Client.min_buffer_len;
+    var s_read_buf: [min_len]u8 = undefined;
+    var s_write_buf: [min_len]u8 = undefined;
+    var t_read_buf: [min_len + 4096]u8 = undefined;
+    var t_write_buf: [min_len]u8 = undefined;
+
+    var s_reader = hub_tcp.reader(&s_read_buf);
+    var s_writer = hub_tcp.writer(&s_write_buf);
+
+    var tls = std.crypto.tls.Client.init(
+        s_reader.interface(),
+        &s_writer.interface,
+        .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &t_read_buf,
+            .write_buffer = &t_write_buf,
+        },
+    ) catch return;
+
+    const ws_upgrade = "GET /api/v2/stream HTTP/1.1\r\n" ++
+        "Host: 34.88.228.23\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    tls.writer.writeAll(ws_upgrade) catch return;
+    tls.writer.flush() catch return;
+    s_writer.interface.flush() catch return;
+
+    var resp_buf: [512]u8 = undefined;
+    var head_len: usize = 0;
+    while (head_len < resp_buf.len) {
+        const byte = tls.reader.takeByte() catch break;
+        resp_buf[head_len] = byte;
+        head_len += 1;
+        if (head_len >= 4 and std.mem.eql(u8, resp_buf[head_len - 4 .. head_len], "\r\n\r\n")) break;
+    }
+
+    var connect_frame: [512]u8 = undefined;
+    const payload_len = 1 + 1 + domain.len + 2;
+    std.mem.writeInt(u32, connect_frame[0..4], 1, .big);
+    connect_frame[4] = 0x01;
+    connect_frame[5] = 0x00;
+    std.mem.writeInt(u16, connect_frame[6..8], @intCast(payload_len), .big);
+    connect_frame[8] = 0x02;
+    connect_frame[9] = @intCast(domain.len);
+    @memcpy(connect_frame[10 .. 10 + domain.len], domain);
+    std.mem.writeInt(u16, connect_frame[10 + domain.len ..][0..2], target_port, .big);
+
+    tls.writer.writeAll(connect_frame[0 .. 8 + payload_len]) catch return;
+    tls.writer.flush() catch return;
+    s_writer.interface.flush() catch return;
+
+    var ack_buf: [10]u8 = undefined;
+    for (&ack_buf) |*b| {
+        b.* = tls.reader.takeByte() catch break;
+    }
+
+    tls.writer.writeAll(initial_payload) catch return;
+    tls.writer.flush() catch return;
+    s_writer.interface.flush() catch return;
 
     var server_seq: u32 = 0x10000001;
-    var resp_buf: [16384]u8 = undefined;
+    var target_resp_buf: [16384]u8 = undefined;
     var tcp_pkt_buf: [16384 + 128]u8 = undefined;
 
     while (!should_exit.load(.seq_cst)) {
-        const n = target_stream.read(&resp_buf) catch break;
+        const n = tls.reader.readSliceShort(&target_resp_buf) catch break;
         if (n == 0) break;
 
         const pkt_len = tcp_engine.buildTcpPacket(
@@ -179,7 +243,7 @@ fn forwardTcpStream(
             server_seq,
             client_ack_seq,
             0x18,
-            resp_buf[0..n],
+            target_resp_buf[0..n],
             &tcp_pkt_buf,
         ) orelse break;
 
@@ -188,19 +252,19 @@ fn forwardTcpStream(
     }
 }
 
-fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
+fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice, hub_host: []const u8, hub_port: u16) void {
     var packet_buf: [2048]u8 = undefined;
     while (!should_exit.load(.seq_cst)) {
         const read_res = tun_dev.readPacket(&packet_buf) catch continue;
         if (read_res > 0) {
             const packet = packet_buf[0..read_res];
-
             if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+
                 _ = tun_dev.writePacket(packet) catch {};
             } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
                 if (tcp_res.is_syn) {
                     _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                    std.log.info("User-Space TCP: SYN-ACK handshake generated.", .{});
+                    std.log.info("User-Space TCP: SYN-ACK handshake generated for port {d}.", .{tcp_res.dst_port});
                 } else if (tcp_res.payload.len > 0) {
                     var ack_buf: [128]u8 = undefined;
                     const client_ip = packet[12..16];
@@ -228,7 +292,7 @@ fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
                         }
                     }
 
-                    std.log.info("Forwarding TCP stream to {s}:{d} ({d} bytes)...", .{ domain, tcp_res.dst_port, tcp_res.payload.len });
+                    std.log.info("Tunneling TCP stream via Hub to {s}:{d} ({d} bytes)...", .{ domain, tcp_res.dst_port, tcp_res.payload.len });
 
                     var fake_ip_copy: [4]u8 = undefined;
                     var client_ip_copy: [4]u8 = undefined;
@@ -245,9 +309,10 @@ fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice) void {
                         tcp_res.dst_port,
                         tcp_res.src_port,
                         domain,
-                        tcp_res.dst_port,
                         payload_copy[0..tcp_res.payload.len],
                         tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len)),
+                        hub_host,
+                        hub_port,
                     }) catch null;
                     if (fw_thread) |t| t.detach();
                 }
@@ -426,12 +491,12 @@ pub fn main() !void {
     if (maybe_tun != null) {
         setupRoutes();
         resolv_guard.capture();
-        const pump_thread = std.Thread.spawn(.{}, runTunPump, .{maybe_tun.?}) catch null;
+        const pump_thread = std.Thread.spawn(.{}, runTunPump, .{ maybe_tun.?, host_part, port_part }) catch null;
         if (pump_thread) |t| t.detach();
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
 
-    std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Press Ctrl+C to stop.", .{});
+    std.log.info("MMX Dual-Stack Tunnel active over HTTP/2 WebSocket! Ready to route full system traffic. Press Ctrl+C to stop.", .{});
 
     var ping_seq: u32 = 0;
     while (!should_exit.load(.seq_cst)) {
