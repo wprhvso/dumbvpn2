@@ -8,14 +8,34 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var args_iter = try std.process.argsWithAllocator(allocator);
+    defer args
+_iter.deinit();
+
+    var listen_port: u16 = 4000;
+    var socket_path: ?[]const u8 = null;
+
+    _ = args_iter.next();
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (args_iter.next()) |val| {
+                listen_port = try std.fmt.parseInt(u16, val, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--socket")) {
+            if (args_iter.next()) |val| {
+                socket_path = val;
+            }
+        }
+    }
+
     var r = router.StreamRouter.init(allocator);
     defer r.deinit();
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", 4000);
+    const address = try std.net.Address.parseIp4("0.0.0.0", listen_port);
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
 
-    std.log.info("mesh-server listening on 127.0.0.1:4000", .{});
+    std.log.info("mesh-server listening on 0.0.0.0:{d}", .{listen_port});
 
     while (true) {
         var conn = server.accept() catch |err| {
