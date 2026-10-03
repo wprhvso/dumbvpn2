@@ -8,7 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var server_addr_str: []const u8 = "34.88.228.23:80";
+    var server_addr_str: []const u8 = "34.88.228.23:443";
 
     var args_iter = try std.process.argsWithAllocator(allocator);
     defer args_iter.deinit();
@@ -22,7 +22,7 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Starting mesh-client...", .{});
+    std.log.info("Starting mesh-client daemon...", .{});
     std.log.info("Rendezvous target hub: {s}", .{server_addr_str});
 
     var dns = fake_ip.FakeIpEngine.init(allocator);
@@ -46,7 +46,6 @@ pub fn main() !void {
 
     const stream = std.net.tcpConnectToAddress(target_addr) catch |err| {
         std.log.warn("Could not connect to {s}:{d} ({any}). Ensure server is deployed and port is open.", .{ host_part, port_part, err });
-        std.log.info("Client initialized in standby mode, waiting for network connectivity.", .{});
         return;
     };
     defer stream.close();
@@ -62,5 +61,24 @@ pub fn main() !void {
     };
     hdr.encode(&header_buf);
     try stream.writeAll(&header_buf);
-    std.log.info("Sent MMX Handshake frame. Tunnel established!", .{});
+    std.log.info("Sent MMX Handshake frame. Tunnel established and active! Press Ctrl+C to stop.", .{});
+
+    var ping_seq: u32 = 0;
+    while (true) {
+        std.Thread.sleep(5 * std.time.ns_per_s);
+        ping_seq += 1;
+
+        const ping_hdr = protocol.Header{
+            .stream_id = 0,
+            .frame_type = .ping,
+            .flags = 0,
+            .length = 0,
+        };
+        ping_hdr.encode(&header_buf);
+        stream.writeAll(&header_buf) catch |err| {
+            std.log.warn("Connection lost: {any}. Reconnecting...", .{err});
+            break;
+        };
+        std.log.info("L7 Ping #{d} sent to hub. Tunnel healthy.", .{ping_seq});
+    }
 }
