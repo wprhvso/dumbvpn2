@@ -17,6 +17,11 @@ var global_dns: ?*fake_ip_module.FakeIpEngine = null;
 var writer_mutex: std.Thread.Mutex = .{};
 var tun_mutex: std.Thread.Mutex = .{};
 
+var has_hub_route: bool = false;
+var has_ntp_bypass: bool = false;
+var saved_server_ip: [64]u8 = undefined;
+var saved_server_ip_len: usize = 0;
+
 fn handleSig(sig: i32) callconv(.c) void {
     _ = sig;
     should_exit.store(true, .seq_cst);
@@ -54,6 +59,49 @@ fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) void {
             std.log.warn("Command '{s} {s}' exited with {any}: {s}", .{ argv[0], argv[1], res.term, std.mem.trim(u8, res.stderr, " \n\r") });
         }
     }
+}
+
+fn discoverRoute(allocator: std.mem.Allocator, target_ip: []const u8) struct { gw: []const u8, dev: []const u8 } {
+    const ip_bin = findIpBin();
+    const res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ ip_bin, "route", "get", target_ip },
+    }) catch return .{ .gw = "", .dev = "" };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    var it = std.mem.tokenizeAny(u8, res.stdout, " \t\r\n");
+    var gw: []const u8 = "";
+    var dev: []const u8 = "";
+
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "via")) {
+            if (it.next()) |val| {
+                gw = allocator.dupe(u8, val) catch "";
+            }
+        } else if (std.mem.eql(u8, tok, "dev")) {
+            if (it.next()) |val| {
+                dev = allocator.dupe(u8, val) catch "";
+            }
+        }
+    }
+    return .{ .gw = gw, .dev = dev };
+}
+
+fn isProhibitedPort(port: u16) bool {
+    return switch (port) {
+        25, // SMTP
+        53, // DNS
+        67, 68, // DHCP
+        123, // NTP
+        137, 138, 139, // NetBIOS
+        445, // SMB
+        1900, // SSDP
+        5353, // mDNS
+        5355, // LLMNR
+        => true,
+        else => false,
+    };
 }
 
 const ResolvGuard = struct {
@@ -102,22 +150,76 @@ const ResolvGuard = struct {
     }
 };
 
-fn setupRoutes(allocator: std.mem.Allocator) void {
+fn setupRoutes(allocator: std.mem.Allocator, server_ip_str: []const u8) void {
     const ip_bin = findIpBin();
+    @memcpy(saved_server_ip[0..server_ip_str.len], server_ip_str);
+    saved_server_ip_len = server_ip_str.len;
+
+    const route_info = discoverRoute(allocator, server_ip_str);
+    defer {
+        if (route_info.gw.len > 0) allocator.free(route_info.gw);
+        if (route_info.dev.len > 0) allocator.free(route_info.dev);
+    }
+
+    if (route_info.dev.len > 0) {
+        if (route_info.gw.len > 0) {
+            runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", server_ip_str, "via", route_info.gw, "dev", route_info.dev });
+            std.log.info("Anti-loop: added route {s} via {s} dev {s}", .{ server_ip_str, route_info.gw, route_info.dev });
+        } else {
+            runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", server_ip_str, "dev", route_info.dev });
+            std.log.info("Anti-loop: added route {s} dev {s}", .{ server_ip_str, route_info.dev });
+        }
+        has_hub_route = true;
+
+        if (route_info.gw.len > 0) {
+            runCmd(allocator, &[_][]const u8{ ip_bin, "rule", "add", "fwmark", "0x123", "table", "123", "priority", "100" });
+            runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "default", "via", route_info.gw, "dev", route_info.dev, "table", "123" });
+            runCmd(allocator, &[_][]const u8{ "iptables", "-t", "mangle", "-A", "OUTPUT", "-p", "udp", "--dport", "123", "-j", "MARK", "--set-mark", "0x123" });
+            has_ntp_bypass = true;
+            std.log.info("NTP bypass: routed UDP port 123 via physical gateway {s}", .{route_info.gw});
+        }
+    }
+
     runCmd(allocator, &[_][]const u8{ ip_bin, "link", "set", "mesh0", "mtu", "65535" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "link", "set", "mesh0", "up" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "10.88.0.2/16", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "198.18.0.1/15", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "198.18.0.0/15", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "10.88.0.0/16", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "0.0.0.0/1", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "128.0.0.0/1", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "addr", "add", "fd88::2/64", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "fd88::/64", "dev", "mesh0" });
     runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "fc00::/7", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "::/1", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "8000::/1", "dev", "mesh0" });
+
+    std.log.info("Full-system VPN routing active: all traffic (0.0.0.0/1 and 128.0.0.0/1) routed to mesh0.", .{});
 }
 
 fn teardownRoutes(allocator: std.mem.Allocator) void {
     const ip_bin = findIpBin();
+
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "del", "0.0.0.0/1", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "del", "128.0.0.0/1", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "del", "::/1", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "del", "8000::/1", "dev", "mesh0" });
+
+    if (has_ntp_bypass) {
+        runCmd(allocator, &[_][]const u8{ "iptables", "-t", "mangle", "-D", "OUTPUT", "-p", "udp", "--dport", "123", "-j", "MARK", "--set-mark", "0x123" });
+        runCmd(allocator, &[_][]const u8{ ip_bin, "rule", "del", "fwmark", "0x123", "table", "123" });
+        runCmd(allocator, &[_][]const u8{ ip_bin, "route", "flush", "table", "123" });
+        has_ntp_bypass = false;
+    }
+
+    if (has_hub_route and saved_server_ip_len > 0) {
+        const s_ip = saved_server_ip[0..saved_server_ip_len];
+        runCmd(allocator, &[_][]const u8{ ip_bin, "route", "del", s_ip });
+        has_hub_route = false;
+    }
+
     runCmd(allocator, &[_][]const u8{ ip_bin, "link", "del", "mesh0" });
+    std.log.info("Full-system VPN routing cleaned up cleanly.", .{});
 }
 
 fn runDnsServer(engine: *fake_ip_module.FakeIpEngine) void {
@@ -152,6 +254,34 @@ fn runDnsServer(engine: *fake_ip_module.FakeIpEngine) void {
             }
         }
     }
+}
+
+fn sendWindowUpdate(
+    writer: anytype,
+    stream_writer: anytype,
+    mutex: *std.Thread.Mutex,
+    stream_id: u32,
+    increment: u32,
+) void {
+    if (increment == 0) return;
+    var hdr_buf: [9]u8 = undefined;
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &payload, increment & 0x7FFFFFFF, .big);
+
+    const hdr = h2.FrameHeader{
+        .length = 4,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = stream_id,
+    };
+    hdr.encode(&hdr_buf);
+
+    mutex.lock();
+    defer mutex.unlock();
+    writer.writeAll(&hdr_buf) catch return;
+    writer.writeAll(&payload) catch return;
+    writer.flush() catch return;
+    stream_writer.flush() catch return;
 }
 
 fn writeTunnelFrameH2(
@@ -206,126 +336,112 @@ fn runTunnelReader(
     while (!should_exit.load(.seq_cst)) {
         var raw_hdr: [9]u8 = undefined;
         for (&raw_hdr) |*b| {
-            b.* = reader.takeByte() catch |err| {
-                if (should_exit.load(.seq_cst)) return;
-                std.log.err("Tunnel connection closed or read error: {any}", .{err});
-                should_exit.store(true, .seq_cst);
-                return;
-            };
+            b.* = reader.takeByte() catch return;
         }
         const frame = h2.FrameHeader.decode(&raw_hdr);
 
         if (frame.frame_type == .data and frame.stream_id == 1) {
-            var i: usize = 0;
-            while (i < frame.length) : (i += 1) {
-                const b = reader.takeByte() catch return;
-                const dest = parser.getWriteSlice();
-                if (dest.len > 0) {
-                    dest[0] = b;
-                    parser.advance(1);
-                }
-            }
+            sendWindowUpdate(tls_writer, stream_writer, &writer_mutex, 0, @intCast(frame.length));
+            sendWindowUpdate(tls_writer, stream_writer, &writer_mutex, 1, @intCast(frame.length));
 
-            if (frame.length > 0) {
-                var win_buf: [13]u8 = undefined;
-                const len_u31: u31 = @intCast(@min(frame.length, 0x7FFFFFFF));
-                _ = h2.buildWindowUpdate(1, len_u31, &win_buf);
-                writer_mutex.lock();
-                tls_writer.writeAll(&win_buf) catch {};
-                _ = h2.buildWindowUpdate(0, len_u31, &win_buf);
-                tls_writer.writeAll(&win_buf) catch {};
-                tls_writer.flush() catch {};
-                stream_writer.flush() catch {};
-                writer_mutex.unlock();
+            var rem = frame.length;
+            while (rem > 0) {
+                while (parser.next()) |mmx_frame| {
+                    dispatchMmxFrame(mmx_frame, flow_table, tun_dev, tun_mtx, &tcp_pkt_buf);
+                }
+
+                const dest = parser.getWriteSlice();
+                const chunk = @min(rem, dest.len);
+                if (chunk == 0) {
+                    _ = reader.takeByte() catch return;
+                    rem -= 1;
+                    continue;
+                }
+                var c: usize = 0;
+                while (c < chunk) : (c += 1) {
+                    dest[c] = reader.takeByte() catch return;
+                }
+                parser.advance(chunk);
+                rem -= chunk;
             }
 
             while (parser.next()) |mmx_frame| {
-                if (mmx_frame.header.frame_type == .data) {
-                    if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
-                        const MSS: usize = 1420;
-                        var offset: usize = 0;
-                        while (offset < mmx_frame.payload.len) {
-                            const chunk_len = @min(MSS, mmx_frame.payload.len - offset);
-                            const is_last = (offset + chunk_len == mmx_frame.payload.len);
-                            const flags: u8 = if (is_last) 0x18 else 0x10;
-                            const chunk = mmx_frame.payload[offset .. offset + chunk_len];
-
-                            const pkt_len = tcp_engine.buildTcpPacket(
-                                flow.fake_ip,
-                                flow.client_ip,
-                                flow.target_port,
-                                flow.client_port,
-                                flow.server_seq,
-                                flow.client_seq,
-                                flags,
-                                chunk,
-                                &tcp_pkt_buf,
-                            );
-                            if (pkt_len) |l| {
-                                tun_mtx.lock();
-                                _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch |err| {
-                                    std.log.err("Failed to write to mesh0 ({d} bytes): {any}", .{ l, err });
-                                };
-                                tun_mtx.unlock();
-                                flow.server_seq += @intCast(chunk_len);
-                            }
-                            offset += chunk_len;
-                        }
-
-                        std.log.info("Hub response: flow {d} ({s}:{d}) delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{
-                            flow.stream_id,
-                            flow.getDomain(),
-                            flow.target_port,
-                            mmx_frame.payload.len,
-                        });
-                    }
-                } else if (mmx_frame.header.frame_type == .close) {
-                    if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
-                        const pkt_len = tcp_engine.buildTcpPacket(
-                            flow.fake_ip,
-                            flow.client_ip,
-                            flow.target_port,
-                            flow.client_port,
-                            flow.server_seq,
-                            flow.client_seq,
-                            0x11,
-                            &.{},
-                            &tcp_pkt_buf,
-                        );
-                        if (pkt_len) |l| {
-                            tun_mtx.lock();
-                            _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
-                            tun_mtx.unlock();
-                        }
-                        flow_table.remove(mmx_frame.header.stream_id);
-                    }
-                }
+                dispatchMmxFrame(mmx_frame, flow_table, tun_dev, tun_mtx, &tcp_pkt_buf);
             }
-        } else if (frame.frame_type == .ping and (frame.flags & 0x01) == 0) {
-            var ping_payload: [8]u8 = undefined;
-            for (&ping_payload) |*b| {
-                b.* = reader.takeByte() catch return;
-            }
-            const pong_hdr = h2.FrameHeader{
-                .length = 8,
-                .frame_type = .ping,
-                .flags = 0x01,
-                .stream_id = 0,
-            };
-            var pong_hdr_buf: [9]u8 = undefined;
-            pong_hdr.encode(&pong_hdr_buf);
-
-            writer_mutex.lock();
-            tls_writer.writeAll(&pong_hdr_buf) catch {};
-            tls_writer.writeAll(&ping_payload) catch {};
-            tls_writer.flush() catch {};
-            stream_writer.flush() catch {};
-            writer_mutex.unlock();
         } else {
             var i: usize = 0;
             while (i < frame.length) : (i += 1) {
                 _ = reader.takeByte() catch return;
             }
+        }
+    }
+}
+
+fn dispatchMmxFrame(
+    mmx_frame: protocol.FrameParser.Frame,
+    flow_table: *flow_table_mod.FlowTable,
+    tun_dev: @import("tun/device.zig").TunDevice,
+    tun_mtx: *std.Thread.Mutex,
+    tcp_pkt_buf: []u8,
+) void {
+    if (mmx_frame.header.frame_type == .data) {
+        if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
+            const MSS: usize = 1420;
+            var offset: usize = 0;
+            while (offset < mmx_frame.payload.len) {
+                const chunk_len = @min(MSS, mmx_frame.payload.len - offset);
+                const is_last = (offset + chunk_len == mmx_frame.payload.len);
+                const flags: u8 = if (is_last) 0x18 else 0x10;
+                const chunk = mmx_frame.payload[offset .. offset + chunk_len];
+
+                const pkt_len = tcp_engine.buildTcpPacket(
+                    flow.fake_ip,
+                    flow.client_ip,
+                    flow.target_port,
+                    flow.client_port,
+                    flow.server_seq,
+                    flow.client_seq,
+                    flags,
+                    chunk,
+                    tcp_pkt_buf,
+                );
+                if (pkt_len) |l| {
+                    tun_mtx.lock();
+                    _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch |err| {
+                        std.log.err("Failed to write to mesh0 ({d} bytes): {any}", .{ l, err });
+                    };
+                    tun_mtx.unlock();
+                    flow.server_seq += @intCast(chunk_len);
+                }
+                offset += chunk_len;
+            }
+
+            std.log.info("Hub response: flow {d} ({s}:{d}) delivered {d} bytes to mesh0 (TLS ServerHello / Data).", .{
+                flow.stream_id,
+                flow.getDomain(),
+                flow.target_port,
+                mmx_frame.payload.len,
+            });
+        }
+    } else if (mmx_frame.header.frame_type == .close) {
+        if (flow_table.lookupByStream(mmx_frame.header.stream_id)) |flow| {
+            const pkt_len = tcp_engine.buildTcpPacket(
+                flow.fake_ip,
+                flow.client_ip,
+                flow.target_port,
+                flow.client_port,
+                flow.server_seq,
+                flow.client_seq,
+                0x11,
+                &.{},
+                tcp_pkt_buf,
+            );
+            if (pkt_len) |l| {
+                tun_mtx.lock();
+                _ = tun_dev.writePacket(tcp_pkt_buf[0..l]) catch {};
+                tun_mtx.unlock();
+            }
+            flow_table.remove(mmx_frame.header.stream_id);
         }
     }
 }
@@ -337,6 +453,7 @@ fn runTunReader(
     flow_table: *flow_table_mod.FlowTable,
     tun_mtx: *std.Thread.Mutex,
     dns_engine: *fake_ip_module.FakeIpEngine,
+    server_ip_str: []const u8,
 ) void {
     var packet_buf: [2048]u8 = undefined;
 
@@ -362,10 +479,44 @@ fn runTunReader(
             const target_port = tcp_res.dst_port;
             const target_u32 = std.mem.readInt(u32, &fake_ip, .big);
 
-            var domain: []const u8 = "unknown.domain";
+            if (isProhibitedPort(target_port)) {
+                if (tcp_res.is_syn) {
+                    var rst_buf: [64]u8 = undefined;
+                    const rst_len = tcp_engine.buildTcpPacket(
+                        fake_ip,
+                        client_ip,
+                        target_port,
+                        client_port,
+                        tcp_res.ack,
+                        tcp_res.seq + 1,
+                        0x14,
+                        &.{},
+                        &rst_buf,
+                    );
+                    if (rst_len) |l| {
+                        tun_mtx.lock();
+                        _ = tun_dev.writePacket(rst_buf[0..l]) catch {};
+                        tun_mtx.unlock();
+                    }
+                }
+                continue;
+            }
+
+            var domain_buf: [64]u8 = undefined;
+            var domain: []const u8 = "";
+
             if (dns_engine.lookup(target_u32)) |name| {
                 domain = name;
+            } else {
+                domain = std.fmt.bufPrint(&domain_buf, "{d}.{d}.{d}.{d}", .{
+                    fake_ip[0],
+                    fake_ip[1],
+                    fake_ip[2],
+                    fake_ip[3],
+                }) catch "unknown";
             }
+
+            if (std.mem.eql(u8, domain, server_ip_str)) continue;
 
             if (tcp_res.is_syn) {
                 const flow = flow_table.getOrCreate(
@@ -552,13 +703,9 @@ pub fn main() !void {
     const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     try tls_client.writer.writeAll(PREFACE);
 
-    var settings_payload: [18]u8 = undefined;
-    std.mem.writeInt(u16, settings_payload[0..2], 0x0008, .big); // ENABLE_CONNECT_PROTOCOL
+    var settings_payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, settings_payload[0..2], 0x0008, .big);
     std.mem.writeInt(u32, settings_payload[2..6], 1, .big);
-    std.mem.writeInt(u16, settings_payload[6..8], 0x0004, .big); // INITIAL_WINDOW_SIZE
-    std.mem.writeInt(u32, settings_payload[8..12], 0x40000000, .big);
-    std.mem.writeInt(u16, settings_payload[12..14], 0x0005, .big); // MAX_FRAME_SIZE
-    std.mem.writeInt(u32, settings_payload[14..18], 16384, .big);
 
     const settings_hdr = h2.FrameHeader{
         .length = settings_payload.len,
@@ -570,10 +717,6 @@ pub fn main() !void {
     settings_hdr.encode(&hdr_buf);
     try tls_client.writer.writeAll(&hdr_buf);
     try tls_client.writer.writeAll(&settings_payload);
-
-    var init_win_buf: [13]u8 = undefined;
-    _ = h2.buildWindowUpdate(0, 0x40000000, &init_win_buf);
-    try tls_client.writer.writeAll(&init_win_buf);
 
     var hpack_buf: [512]u8 = undefined;
     var hpack_len: usize = 0;
@@ -653,6 +796,9 @@ pub fn main() !void {
 
     std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
 
+    sendWindowUpdate(&tls_client.writer, &stream_writer.interface, &writer_mutex, 0, 0x3FFFFFFF);
+    sendWindowUpdate(&tls_client.writer, &stream_writer.interface, &writer_mutex, 1, 0x3FFFFFFF);
+
     var resolv_guard = ResolvGuard{};
     defer resolv_guard.restore(allocator);
 
@@ -664,7 +810,7 @@ pub fn main() !void {
     defer teardownRoutes(allocator);
 
     if (maybe_tun != null) {
-        setupRoutes(allocator);
+        setupRoutes(allocator, host_part);
         resolv_guard.capture(allocator);
         const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{
             maybe_tun.?,
@@ -683,6 +829,7 @@ pub fn main() !void {
             &flow_table,
             &tun_mutex,
             &dns,
+            host_part,
         }) catch null;
         if (tun_t) |t| t.detach();
 
