@@ -22,18 +22,52 @@ fn handleSig(sig: i32) callconv(.c) void {
     should_exit.store(true, .seq_cst);
 }
 
+fn findIpBin() []const u8 {
+    const candidates = [_][]const u8{
+        "/run/current-system/sw/bin/ip",
+        "/usr/sbin/ip",
+        "/sbin/ip",
+        "/usr/bin/ip",
+        "/bin/ip",
+    };
+    for (candidates) |path| {
+        if (posix.access(path, posix.X_OK)) |_| {
+            return path;
+        } else |_| {}
+    }
+    return "ip";
+}
+
+fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    const res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    }) catch |err| {
+        std.log.warn("Failed to execute {s}: {any}", .{ argv[0], err });
+        return;
+    };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    if (res.term != .Exited or res.term.Exited != 0) {
+        if (res.stderr.len > 0) {
+            std.log.warn("Command '{s} {s}' exited with {any}: {s}", .{ argv[0], argv[1], res.term, std.mem.trim(u8, res.stderr, " \n\r") });
+        }
+    }
+}
+
 const ResolvGuard = struct {
     has_backup: bool = false,
 
-    pub fn capture(self: *ResolvGuard) void {
+    pub fn capture(self: *ResolvGuard, allocator: std.mem.Allocator) void {
         _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
+            .allocator = allocator,
             .argv = &[_][]const u8{ "cp", "-a", "/etc/resolv.conf", "/etc/resolv.conf.mesh.bak" },
         }) catch return;
         self.has_backup = true;
 
         _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
+            .allocator = allocator,
             .argv = &[_][]const u8{ "chattr", "-i", "/etc/resolv.conf" },
         }) catch {};
 
@@ -43,23 +77,23 @@ const ResolvGuard = struct {
         file.close();
 
         _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
+            .allocator = allocator,
             .argv = &[_][]const u8{ "chattr", "+i", "/etc/resolv.conf" },
         }) catch {};
 
         std.log.info("DNS captured: /etc/resolv.conf updated to 127.0.0.1 & 198.18.0.1 and write-protected (+i).", .{});
     }
 
-    pub fn restore(self: *ResolvGuard) void {
+    pub fn restore(self: *ResolvGuard, allocator: std.mem.Allocator) void {
         if (!self.has_backup) return;
 
         _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
+            .allocator = allocator,
             .argv = &[_][]const u8{ "chattr", "-i", "/etc/resolv.conf" },
         }) catch {};
 
         _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
+            .allocator = allocator,
             .argv = &[_][]const u8{ "mv", "-f", "/etc/resolv.conf.mesh.bak", "/etc/resolv.conf" },
         }) catch {};
 
@@ -68,53 +102,21 @@ const ResolvGuard = struct {
     }
 };
 
-fn setupRoutes() void {
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "link", "set", "mesh0", "up" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "addr", "add", "10.88.0.2/16", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "addr", "add", "198.18.0.1/15", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "route", "add", "198.18.0.0/15", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "route", "add", "10.88.0.0/16", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "-6", "addr", "add", "fd88::2/64", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "-6", "route", "add", "fd88::/64", "dev", "mesh0" },
-    }) catch {};
-
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "-6", "route", "add", "fc00::/7", "dev", "mesh0" },
-    }) catch {};
+fn setupRoutes(allocator: std.mem.Allocator) void {
+    const ip_bin = findIpBin();
+    runCmd(allocator, &[_][]const u8{ ip_bin, "link", "set", "mesh0", "up" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "10.88.0.2/16", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "addr", "add", "198.18.0.1/15", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "198.18.0.0/15", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "route", "replace", "10.88.0.0/16", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "addr", "add", "fd88::2/64", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "fd88::/64", "dev", "mesh0" });
+    runCmd(allocator, &[_][]const u8{ ip_bin, "-6", "route", "replace", "fc00::/7", "dev", "mesh0" });
 }
 
-fn teardownRoutes() void {
-    _ = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
-        .argv = &[_][]const u8{ "ip", "link", "del", "mesh0" },
-    }) catch {};
+fn teardownRoutes(allocator: std.mem.Allocator) void {
+    const ip_bin = findIpBin();
+    runCmd(allocator, &[_][]const u8{ ip_bin, "link", "del", "mesh0" });
 }
 
 fn runDnsServer(engine: *fake_ip_module.FakeIpEngine) void {
@@ -131,9 +133,9 @@ fn runDnsServer(engine: *fake_ip_module.FakeIpEngine) void {
     var buf: [1024]u8 = undefined;
     var resp_buf: [1024]u8 = undefined;
     var client_addr: posix.sockaddr.storage = undefined;
-    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
     while (!should_exit.load(.seq_cst)) {
+        var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const len = posix.recvfrom(socket, &buf, 0, @ptrCast(&client_addr), &client_addr_len) catch continue;
         if (len < 12) continue;
 
@@ -270,6 +272,137 @@ fn runTunnelReader(
             var i: usize = 0;
             while (i < frame.length) : (i += 1) {
                 _ = reader.takeByte() catch return;
+            }
+        }
+    }
+}
+
+fn runTunReader(
+    tun_dev: @import("tun/device.zig").TunDevice,
+    tls_writer: anytype,
+    stream_writer: anytype,
+    flow_table: *flow_table_mod.FlowTable,
+    tun_mtx: *std.Thread.Mutex,
+    dns_engine: *fake_ip_module.FakeIpEngine,
+) void {
+    var packet_buf: [2048]u8 = undefined;
+
+    while (!should_exit.load(.seq_cst)) {
+        const read_res = tun_dev.readPacket(&packet_buf) catch |err| {
+            if (should_exit.load(.seq_cst)) break;
+            std.log.err("tun_dev.readPacket error: {any}", .{err});
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
+        if (read_res == 0) continue;
+
+        const packet = packet_buf[0..read_res];
+
+        if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
+            tun_mtx.lock();
+            _ = tun_dev.writePacket(packet) catch {};
+            tun_mtx.unlock();
+        } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
+            const client_ip = tcp_res.src_ip;
+            const fake_ip = tcp_res.dst_ip;
+            const client_port = tcp_res.src_port;
+            const target_port = tcp_res.dst_port;
+            const target_u32 = std.mem.readInt(u32, &fake_ip, .big);
+
+            var domain: []const u8 = "unknown.domain";
+            if (dns_engine.lookup(target_u32)) |name| {
+                domain = name;
+            }
+
+            if (tcp_res.is_syn) {
+                const flow = flow_table.getOrCreate(
+                    client_ip,
+                    fake_ip,
+                    client_port,
+                    target_port,
+                    domain,
+                    tcp_res.seq,
+                ) catch continue;
+
+                tun_mtx.lock();
+                _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
+                tun_mtx.unlock();
+
+                std.log.info("User-Space TCP: SYN-ACK handshake generated for {s}:{d} (flow {d}, port {d}).", .{
+                    domain,
+                    target_port,
+                    flow.stream_id,
+                    client_port,
+                });
+
+                var connect_payload: [512]u8 = undefined;
+                connect_payload[0] = 0x02; // Domain
+                connect_payload[1] = @intCast(domain.len);
+                @memcpy(connect_payload[2 .. 2 + domain.len], domain);
+                std.mem.writeInt(u16, connect_payload[2 + domain.len ..][0..2], target_port, .big);
+                const c_len = 2 + domain.len + 2;
+
+                writeTunnelFrameH2(
+                    tls_writer,
+                    stream_writer,
+                    &writer_mutex,
+                    flow.stream_id,
+                    .connect,
+                    0,
+                    connect_payload[0..c_len],
+                );
+                std.log.info("Sent MMX CONNECT for flow {d} ({s}:{d}) over HTTP/2 Stream 1!", .{ flow.stream_id, domain, target_port });
+            } else if (tcp_res.payload.len > 0) {
+                if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                    flow.client_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
+
+                    var ack_buf: [128]u8 = undefined;
+                    const ack_len = tcp_engine.buildTcpPacket(
+                        flow.fake_ip,
+                        flow.client_ip,
+                        flow.target_port,
+                        flow.client_port,
+                        flow.server_seq,
+                        flow.client_seq,
+                        0x10,
+                        &.{},
+                        &ack_buf,
+                    );
+                    if (ack_len) |l| {
+                        tun_mtx.lock();
+                        _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
+                        tun_mtx.unlock();
+                    }
+
+                    writeTunnelFrameH2(
+                        tls_writer,
+                        stream_writer,
+                        &writer_mutex,
+                        flow.stream_id,
+                        .data,
+                        0,
+                        tcp_res.payload,
+                    );
+                    std.log.info("Streamed {d} bytes for flow {d} to {s}:{d} over HTTP/2!", .{ tcp_res.payload.len, flow.stream_id, flow.getDomain(), target_port });
+                }
+            } else if (tcp_res.is_fin or tcp_res.is_rst) {
+                if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                    writeTunnelFrameH2(
+                        tls_writer,
+                        stream_writer,
+                        &writer_mutex,
+                        flow.stream_id,
+                        .close,
+                        if (tcp_res.is_fin) protocol.Flags.FIN else protocol.Flags.RST,
+                        &.{},
+                    );
+                    flow_table.remove(flow.stream_id);
+                }
+            } else if (tcp_res.is_ack) {
+                if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
+                    flow.established = true;
+                    flow.client_seq = tcp_res.seq;
+                }
             }
         }
     }
@@ -460,18 +593,18 @@ pub fn main() !void {
     std.log.info("HTTP/2 RFC 8441 WebSocket stream established on Stream 1!", .{});
 
     var resolv_guard = ResolvGuard{};
-    defer resolv_guard.restore();
+    defer resolv_guard.restore(allocator);
 
     const maybe_tun = tun_linux.openTun("mesh0") catch |err| blk: {
-        std.log.warn("Could not open /dev/net/tun: {any}. Run with sudo for full system TUN.", .{err});
+        std.log.err("Could not open /dev/net/tun: {any}. Run with sudo for full system TUN.", .{err});
         break :blk null;
     };
     defer if (maybe_tun) |t| t.close();
-    defer teardownRoutes();
+    defer teardownRoutes(allocator);
 
     if (maybe_tun != null) {
-        setupRoutes();
-        resolv_guard.capture();
+        setupRoutes(allocator);
+        resolv_guard.capture(allocator);
         const reader_t = std.Thread.spawn(.{}, runTunnelReader, .{
             maybe_tun.?,
             &tls_client.reader,
@@ -479,6 +612,17 @@ pub fn main() !void {
             &tun_mutex,
         }) catch null;
         if (reader_t) |t| t.detach();
+
+        const tun_t = std.Thread.spawn(.{}, runTunReader, .{
+            maybe_tun.?,
+            &tls_client.writer,
+            &stream_writer.interface,
+            &flow_table,
+            &tun_mutex,
+            &dns,
+        }) catch null;
+        if (tun_t) |t| t.detach();
+
         std.log.info("Dual-Stack L3 TUN mesh0 UP: IPv4 10.88.0.2/16, Fake-IP 198.18.0.1/15, IPv6 fd88::2/64.", .{});
     }
 
@@ -486,140 +630,20 @@ pub fn main() !void {
 
     var ping_seq: u32 = 0;
     while (!should_exit.load(.seq_cst)) {
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        std.Thread.sleep(5 * std.time.ns_per_s);
         if (should_exit.load(.seq_cst)) break;
 
-        if (maybe_tun) |tun_dev| {
-            var packet_buf: [2048]u8 = undefined;
-            const read_res = tun_dev.readPacket(&packet_buf) catch 0;
-            if (read_res > 0) {
-                const packet = packet_buf[0..read_res];
-
-                if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
-                    tun_mutex.lock();
-                    _ = tun_dev.writePacket(packet) catch {};
-                    tun_mutex.unlock();
-                } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
-                    const client_ip = tcp_res.src_ip;
-                    const fake_ip = tcp_res.dst_ip;
-                    const client_port = tcp_res.src_port;
-                    const target_port = tcp_res.dst_port;
-                    const target_u32 = std.mem.readInt(u32, &fake_ip, .big);
-
-                    var domain: []const u8 = "icanhazip.com";
-                    if (global_dns) |d| {
-                        if (d.lookup(target_u32)) |name| {
-                            domain = name;
-                        }
-                    }
-
-                    if (tcp_res.is_syn) {
-                        const flow = flow_table.getOrCreate(
-                            client_ip,
-                            fake_ip,
-                            client_port,
-                            target_port,
-                            domain,
-                            tcp_res.seq,
-                        ) catch continue;
-
-                        tun_mutex.lock();
-                        _ = tun_dev.writePacket(packet[0..tcp_res.reply_len]) catch {};
-                        tun_mutex.unlock();
-
-                        std.log.info("User-Space TCP: SYN-ACK handshake generated for {s}:{d} (flow {d}, port {d}).", .{
-                            domain,
-                            target_port,
-                            flow.stream_id,
-                            client_port,
-                        });
-
-                        var connect_payload: [512]u8 = undefined;
-                        connect_payload[0] = 0x02; // Domain
-                        connect_payload[1] = @intCast(domain.len);
-                        @memcpy(connect_payload[2 .. 2 + domain.len], domain);
-                        std.mem.writeInt(u16, connect_payload[2 + domain.len ..][0..2], target_port, .big);
-                        const c_len = 2 + domain.len + 2;
-
-                        writeTunnelFrameH2(
-                            &tls_client.writer,
-                            &stream_writer.interface,
-                            &writer_mutex,
-                            flow.stream_id,
-                            .connect,
-                            0,
-                            connect_payload[0..c_len],
-                        );
-                        std.log.info("Sent MMX CONNECT for flow {d} ({s}:{d}) over HTTP/2 Stream 1!", .{ flow.stream_id, domain, target_port });
-                    } else if (tcp_res.payload.len > 0) {
-                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
-                            flow.client_seq = tcp_res.seq + @as(u32, @intCast(tcp_res.payload.len));
-
-                            var ack_buf: [128]u8 = undefined;
-                            const ack_len = tcp_engine.buildTcpPacket(
-                                flow.fake_ip,
-                                flow.client_ip,
-                                flow.target_port,
-                                flow.client_port,
-                                flow.server_seq,
-                                flow.client_seq,
-                                0x10,
-                                &.{},
-                                &ack_buf,
-                            );
-                            if (ack_len) |l| {
-                                tun_mutex.lock();
-                                _ = tun_dev.writePacket(ack_buf[0..l]) catch {};
-                                tun_mutex.unlock();
-                            }
-
-                            writeTunnelFrameH2(
-                                &tls_client.writer,
-                                &stream_writer.interface,
-                                &writer_mutex,
-                                flow.stream_id,
-                                .data,
-                                0,
-                                tcp_res.payload,
-                            );
-                            std.log.info("Streamed {d} bytes for flow {d} to {s}:{d} over HTTP/2!", .{ tcp_res.payload.len, flow.stream_id, flow.getDomain(), target_port });
-                        }
-                    } else if (tcp_res.is_fin or tcp_res.is_rst) {
-                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
-                            writeTunnelFrameH2(
-                                &tls_client.writer,
-                                &stream_writer.interface,
-                                &writer_mutex,
-                                flow.stream_id,
-                                .close,
-                                if (tcp_res.is_fin) protocol.Flags.FIN else protocol.Flags.RST,
-                                &.{},
-                            );
-                            flow_table.remove(flow.stream_id);
-                        }
-                    } else if (tcp_res.is_ack) {
-                        if (flow_table.lookupByKey(client_ip, fake_ip, client_port, target_port)) |flow| {
-                            flow.established = true;
-                            flow.client_seq = tcp_res.seq;
-                        }
-                    }
-                }
-            }
-        }
-
         ping_seq += 1;
-        if (ping_seq % 250 == 0) {
-            writeTunnelFrameH2(
-                &tls_client.writer,
-                &stream_writer.interface,
-                &writer_mutex,
-                0,
-                .ping,
-                0,
-                &.{},
-            );
-            std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq / 250});
-        }
+        writeTunnelFrameH2(
+            &tls_client.writer,
+            &stream_writer.interface,
+            &writer_mutex,
+            0,
+            .ping,
+            0,
+            &.{},
+        );
+        std.log.info("HTTP/2 L7 Heartbeat #{d} delivered. Dual-Stack Hub is healthy.", .{ping_seq});
     }
 
     std.log.info("Shutting down cleanly: restoring DNS and network interfaces...", .{});
