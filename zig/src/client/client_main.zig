@@ -4,6 +4,7 @@ const common = @import("common");
 const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
 const h2 = @import("h2.zig");
+const ws = common.ws;
 const tun_linux = @import("tun/tun_linux.zig");
 const icmp_engine = @import("tun/icmp_engine.zig");
 const tcp_engine = @import("tun/tcp_engine.zig");
@@ -214,16 +215,18 @@ fn forwardTcpStream(
     @memcpy(connect_frame[10 .. 10 + domain.len], domain);
     std.mem.writeInt(u16, connect_frame[10 + domain.len ..][0..2], target_port, .big);
 
-    tls.writer.writeAll(connect_frame[0 .. 8 + payload_len]) catch return;
+    var ws_frame_buf: [1024]u8 = undefined;
+    const ws_c_len = ws.wrapWsBinaryMasked(connect_frame[0 .. 8 + payload_len], &ws_frame_buf);
+    tls.writer.writeAll(ws_frame_buf[0..ws_c_len]) catch return;
     tls.writer.flush() catch return;
     s_writer.interface.flush() catch return;
 
-    var ack_buf: [10]u8 = undefined;
-    for (&ack_buf) |*b| {
-        b.* = tls.reader.takeByte() catch break;
-    }
+    var ack_frame: [64]u8 = undefined;
+    _ = tls.reader.readSliceShort(&ack_frame) catch {};
 
-    tls.writer.writeAll(initial_payload) catch return;
+    var ws_payload_buf: [4096]u8 = undefined;
+    const ws_p_len = ws.wrapWsBinaryMasked(initial_payload, &ws_payload_buf);
+    tls.writer.writeAll(ws_payload_buf[0..ws_p_len]) catch return;
     tls.writer.flush() catch return;
     s_writer.interface.flush() catch return;
 
@@ -235,6 +238,14 @@ fn forwardTcpStream(
         const n = tls.reader.readSliceShort(&target_resp_buf) catch break;
         if (n == 0) break;
 
+        var clean_data: []const u8 = target_resp_buf[0..n];
+        if (ws.unwrapWs(target_resp_buf[0..n])) |unwrapped| {
+            clean_data = unwrapped;
+        }
+
+        if (clean_data.len == 0) continue;
+        if (clean_data.len == 8 and clean_data[4] == 0x01) continue;
+
         const pkt_len = tcp_engine.buildTcpPacket(
             fake_ip_bytes,
             client_ip_bytes,
@@ -243,12 +254,12 @@ fn forwardTcpStream(
             server_seq,
             client_ack_seq,
             0x18,
-            target_resp_buf[0..n],
+            clean_data,
             &tcp_pkt_buf,
         ) orelse break;
 
         _ = tun_dev.writePacket(tcp_pkt_buf[0..pkt_len]) catch break;
-        server_seq += @intCast(n);
+        server_seq += @intCast(clean_data.len);
     }
 }
 
@@ -258,8 +269,8 @@ fn runTunPump(tun_dev: @import("tun/device.zig").TunDevice, hub_host: []const u8
         const read_res = tun_dev.readPacket(&packet_buf) catch continue;
         if (read_res > 0) {
             const packet = packet_buf[0..read_res];
-            if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
 
+            if (icmp_engine.IcmpEngine.handleIcmp(packet)) {
                 _ = tun_dev.writePacket(packet) catch {};
             } else if (tcp_engine.TcpEngine.handlePacket(packet)) |tcp_res| {
                 if (tcp_res.is_syn) {

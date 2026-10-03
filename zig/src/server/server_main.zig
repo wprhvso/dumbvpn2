@@ -1,5 +1,5 @@
 const std = @import("std");
-const ws = @import("ws_listener.zig");
+const ws = common.ws;
 const router = @import("stream_router.zig");
 const embedded_ui = @import("embedded_ui.zig");
 const common = @import("common");
@@ -10,33 +10,22 @@ fn pumpWsToTarget(src: std.net.Stream, dst: std.net.Stream) void {
     while (true) {
         const len = src.read(&buf) catch break;
         if (len == 0) break;
-        dst.writeAll(buf[0..len]) catch break;
+        if (ws.unwrapWs(buf[0..len])) |payload| {
+            dst.writeAll(payload) catch break;
+        } else {
+            dst.writeAll(buf[0..len]) catch break;
+        }
     }
 }
 
 fn pumpTargetToWs(src: std.net.Stream, dst: std.net.Stream) void {
     var buf: [16384]u8 = undefined;
-    var ws_frame_buf: [16384 + 10]u8 = undefined;
+    var ws_frame_buf: [16384 + 16]u8 = undefined;
     while (true) {
         const len = src.read(&buf) catch break;
         if (len == 0) break;
-
-        var offset: usize = 0;
-        ws_frame_buf[0] = 0x82;
-        if (len < 126) {
-            ws_frame_buf[1] = @intCast(len);
-            offset = 2;
-        } else if (len <= 65535) {
-            ws_frame_buf[1] = 126;
-            std.mem.writeInt(u16, ws_frame_buf[2..4], @intCast(len), .big);
-            offset = 4;
-        } else {
-            ws_frame_buf[1] = 127;
-            std.mem.writeInt(u64, ws_frame_buf[2..10], @intCast(len), .big);
-            offset = 10;
-        }
-        @memcpy(ws_frame_buf[offset .. offset + len], buf[0..len]);
-        dst.writeAll(ws_frame_buf[0 .. offset + len]) catch break;
+        const frame_len = ws.wrapWsBinaryServer(buf[0..len], &ws_frame_buf);
+        dst.writeAll(ws_frame_buf[0..frame_len]) catch break;
     }
 }
 
@@ -74,13 +63,17 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         while (true) {
             const n = conn.stream.read(&stream_buf) catch break;
             if (n == 0) break;
-            const payload = stream_buf[0..n];
+            var payload = stream_buf[0..n];
+            if (ws.unwrapWs(stream_buf[0..n])) |unwrapped| {
+                payload = unwrapped;
+            }
 
             if (payload.len >= 8) {
                 const hdr = protocol.Header.decode(payload[0..8]);
                 if (hdr.frame_type == .ping) {
-                    const pong_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 0, 0x06, 0, 0, 0 };
-                    _ = conn.stream.writeAll(&pong_frame) catch break;
+                    var pong_buf: [16]u8 = undefined;
+                    const frame_len = ws.wrapWsBinaryServer(&[_]u8{ 0, 0, 0, 0, 0x06, 0, 0, 0 }, &pong_buf);
+                    _ = conn.stream.writeAll(pong_buf[0..frame_len]) catch break;
                 } else if (hdr.frame_type == .connect and payload.len >= 12) {
                     const addr_type = payload[8];
                     var target_port: u16 = 80;
@@ -99,8 +92,9 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                         const target_stream = std.net.tcpConnectToHost(allocator, target_host, target_port) catch break;
                         defer target_stream.close();
 
-                        const ack_frame = [_]u8{ 0x82, 0x08, 0, 0, 0, 1, 0x01, 0, 0, 0 };
-                        _ = conn.stream.writeAll(&ack_frame) catch break;
+                        var ack_buf: [16]u8 = undefined;
+                        const ack_len = ws.wrapWsBinaryServer(&[_]u8{ 0, 0, 0, 1, 0x01, 0, 0, 0 }, &ack_buf);
+                        _ = conn.stream.writeAll(ack_buf[0..ack_len]) catch break;
 
                         const t1 = std.Thread.spawn(.{}, pumpWsToTarget, .{ conn.stream, target_stream }) catch break;
                         t1.detach();
