@@ -3,17 +3,20 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug symbols") orelse true;
 
     const common_mod = b.createModule(.{
         .root_source_file = b.path("src/common/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
 
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/server_main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     server_mod.addImport("common", common_mod);
 
@@ -21,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/server/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     server_lib_mod.addImport("common", common_mod);
 
@@ -28,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client/client_main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     client_mod.addImport("common", common_mod);
 
@@ -35,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     client_lib_mod.addImport("common", common_mod);
 
@@ -58,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/android_jni/jni_bridge.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     android_mod.addImport("common", common_mod);
 

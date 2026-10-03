@@ -6,20 +6,20 @@ build-ui:
     mkdir -p zig/src/server/assets
     cp -r svelte/dist/* zig/src/server/assets/
 
-build-server target="x86_64-linux-musl": build-ui
-    cd zig && zig build -Dtarget={{target}} -Doptimize=ReleaseFast server
+build-server target="x86_64-linux-musl" cpu="baseline": build-ui
+    cd zig && zig build -Dtarget={{target}} -Dcpu={{cpu}} -Doptimize=ReleaseSmall server
 
-build-client:
-    cd zig && zig build -Doptimize=ReleaseFast client
+build-client target="x86_64-linux-musl" cpu="baseline":
+    cd zig && zig build -Dtarget={{target}} -Dcpu={{cpu}} -Doptimize=ReleaseSmall client
 
 build-android-core:
-    cd zig && zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast android_lib
+    cd zig && zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseSmall android_lib
     mkdir -p android/app/src/main/jniLibs/arm64-v8a
     cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/arm64-v8a/
-    cd zig && zig build -Dtarget=arm-linux-androideabi -Doptimize=ReleaseFast android_lib
+    cd zig && zig build -Dtarget=arm-linux-androideabi -Doptimize=ReleaseSmall android_lib
     mkdir -p android/app/src/main/jniLibs/armeabi-v7a
     cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/armeabi-v7a/
-    cd zig && zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast android_lib
+    cd zig && zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseSmall android_lib
     mkdir -p android/app/src/main/jniLibs/x86_64
     cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/x86_64/
 
@@ -43,4 +43,4 @@ deploy-server: build-server
 
 deploy-quick target="pectinkne_pecrucks_restcuts@34.88.228.23": build-server
     scp zig/zig-out/bin/mesh-server {{target}}:/tmp/mesh-server
-    ssh {{target}} "sudo mv /tmp/mesh-server /usr/local/bin/mesh-server && sudo chmod +x /usr/local/bin/mesh-server"
+    ssh {{target}} "sudo mv /tmp/mesh-server /usr/local/bin/mesh-server && sudo chmod +x /usr/local/bin/mesh-server && sudo systemctl restart mesh-server"
