@@ -14,14 +14,14 @@ build-client:
 
 build-android-core:
     cd zig && zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast android_lib
-    cd zig && zig build -Dtarget=arm-linux-androideabi -Doptimize=ReleaseFast android_lib
-    cd zig && zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast android_lib
     mkdir -p android/app/src/main/jniLibs/arm64-v8a
+    cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/arm64-v8a/
+    cd zig && zig build -Dtarget=arm-linux-androideabi -Doptimize=ReleaseFast android_lib
     mkdir -p android/app/src/main/jniLibs/armeabi-v7a
+    cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/armeabi-v7a/
+    cd zig && zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast android_lib
     mkdir -p android/app/src/main/jniLibs/x86_64
-    cp zig/zig-out/lib/aarch64/libcore.so android/app/src/main/jniLibs/arm64-v8a/
-    cp zig/zig-out/lib/arm/libcore.so android/app/src/main/jniLibs/armeabi-v7a/
-    cp zig/zig-out/lib/x86_64/libcore.so android/app/src/main/jniLibs/x86_64/
+    cp zig/zig-out/lib/libcore.so android/app/src/main/jniLibs/x86_64/
 
 build-apk: build-android-core
     cd android && ./gradlew assembleRelease

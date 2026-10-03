@@ -17,13 +17,12 @@ pub fn build(b: *std.Build) void {
     });
     server_mod.addImport("common", common_mod);
 
-    const server_exe = b.addExecutable(.{
-        .name = "mesh-server",
-        .root_module = server_mod,
+    const server_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    b.installArtifact(server_exe);
-    const server_step = b.step("server", "Build server executable");
-    server_step.dependOn(&b.addInstallArtifact(server_exe, .{}).step);
+    server_lib_mod.addImport("common", common_mod);
 
     const client_mod = b.createModule(.{
         .root_source_file = b.path("src/client/client_main.zig"),
@@ -31,6 +30,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_mod.addImport("common", common_mod);
+
+    const client_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/client/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_lib_mod.addImport("common", common_mod);
+
+    const server_exe = b.addExecutable(.{
+        .name = "mesh-server",
+        .root_module = server_mod,
+    });
+    b.installArtifact(server_exe);
+    const server_step = b.step("server", "Build server executable");
+    server_step.dependOn(&b.addInstallArtifact(server_exe, .{}).step);
 
     const client_exe = b.addExecutable(.{
         .name = "mesh-client",
@@ -62,6 +76,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.addImport("common", common_mod);
+    test_mod.addImport("server", server_lib_mod);
+    test_mod.addImport("client", client_lib_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

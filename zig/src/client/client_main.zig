@@ -1,6 +1,4 @@
 const std = @import("std");
-const common = @import("common");
-const protocol = common.protocol;
 const fake_ip = @import("fake_ip.zig");
 
 pub fn main() !void {
@@ -11,15 +9,12 @@ pub fn main() !void {
     var dns = fake_ip.FakeIpEngine.init(allocator);
     defer dns.deinit();
 
-    const ip = try dns.allocate("example.com");
-    _ = ip;
+    std.log.info("mesh-client started", .{});
 
-    var buf: [8]u8 = undefined;
-    const hdr = protocol.Header{
-        .stream_id = 1,
-        .frame_type = .connect,
-        .flags = 0,
-        .length = 0,
-    };
-    hdr.encode(&buf);
+    const ip = try dns.allocate("example.com");
+    std.log.info("Allocated fake IP 0x{x} for example.com", .{ip});
+
+    if (dns.lookup(ip)) |domain| {
+        std.log.info("Reverse lookup 0x{x} -> {s}", .{ ip, domain });
+    }
 }
