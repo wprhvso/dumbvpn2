@@ -24,67 +24,103 @@ const UpstreamSession = struct {
     }
 };
 
-fn writeTunnelFrame(
+const ConnectionContext = struct {
     conn_stream: std.net.Stream,
-    mutex: *std.Thread.Mutex,
-    stream_id: u32,
-    frame_type: protocol.FrameType,
-    flags: u8,
-    payload: []const u8,
-) !void {
-    var hdr_buf: [8]u8 = undefined;
-    const hdr = protocol.Header{
-        .stream_id = stream_id,
-        .frame_type = frame_type,
-        .flags = flags,
-        .length = @intCast(payload.len),
-    };
-    hdr.encode(&hdr_buf);
-    mutex.lock();
-    defer mutex.unlock();
-    try conn_stream.writeAll(&hdr_buf);
-    if (payload.len > 0) {
-        try conn_stream.writeAll(payload);
+    write_mutex: std.Thread.Mutex = .{},
+    sessions_mutex: std.Thread.Mutex = .{},
+    sessions: std.AutoHashMap(u32, *UpstreamSession),
+    active: std.atomic.Value(bool),
+    ref_count: std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
+
+    pub fn create(allocator: std.mem.Allocator, stream: std.net.Stream) !*ConnectionContext {
+        const ctx = try allocator.create(ConnectionContext);
+        ctx.* = .{
+            .conn_stream = stream,
+            .write_mutex = .{},
+            .sessions_mutex = .{},
+            .sessions = std.AutoHashMap(u32, *UpstreamSession).init(allocator),
+            .active = std.atomic.Value(bool).init(true),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .allocator = allocator,
+        };
+        return ctx;
     }
-}
+
+    pub fn acquire(self: *ConnectionContext) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn release(self: *ConnectionContext) void {
+        if (self.ref_count.fetchSub(1, .seq_cst) == 1) {
+            self.conn_stream.close();
+            self.sessions.deinit();
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn writeFrame(self: *ConnectionContext, stream_id: u32, frame_type: protocol.FrameType, flags: u8, payload: []const u8) !void {
+        if (!self.active.load(.seq_cst)) return error.ConnectionClosed;
+        var hdr_buf: [8]u8 = undefined;
+        const hdr = protocol.Header{
+            .stream_id = stream_id,
+            .frame_type = frame_type,
+            .flags = flags,
+            .length = @intCast(payload.len),
+        };
+        hdr.encode(&hdr_buf);
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try self.conn_stream.writeAll(&hdr_buf);
+        if (payload.len > 0) {
+            try self.conn_stream.writeAll(payload);
+        }
+    }
+};
 
 fn pumpUpstreamToTunnel(
-    allocator: std.mem.Allocator,
+    ctx: *ConnectionContext,
     session: *UpstreamSession,
-    conn_stream: std.net.Stream,
-    write_mutex: *std.Thread.Mutex,
 ) void {
     defer {
         session.active.store(false, .seq_cst);
-        session.release(allocator);
+        session.release(ctx.allocator);
+        ctx.release();
     }
 
     var buf: [16384]u8 = undefined;
-    while (session.active.load(.seq_cst)) {
+    while (session.active.load(.seq_cst) and ctx.active.load(.seq_cst)) {
         const n = session.target_stream.read(&buf) catch break;
         if (n == 0) break;
         std.log.info("[Hub] Upstream {s}:{d} read {d} bytes, encoding into tunnel frame (stream {d})", .{ session.getHost(), session.target_port, n, session.stream_id });
-        writeTunnelFrame(conn_stream, write_mutex, session.stream_id, .data, 0, buf[0..n]) catch break;
+        ctx.writeFrame(session.stream_id, .data, 0, buf[0..n]) catch break;
     }
-    writeTunnelFrame(conn_stream, write_mutex, session.stream_id, .close, protocol.Flags.FIN, &.{}) catch {};
+    ctx.writeFrame(session.stream_id, .close, protocol.Flags.FIN, &.{}) catch {};
     std.log.info("[Hub] Upstream session completed for {s}:{d} (stream {d})", .{ session.getHost(), session.target_port, session.stream_id });
 }
 
 fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
-
     std.log.info("Incoming connection accepted from {any}", .{conn.address});
 
     var buf: [4096]u8 = undefined;
-    const read_len = conn.stream.read(&buf) catch return;
-    if (read_len == 0) return;
+    const read_len = conn.stream.read(&buf) catch {
+        conn.stream.close();
+        return;
+    };
+    if (read_len == 0) {
+        conn.stream.close();
+        return;
+    }
     const data = buf[0..read_len];
 
     if (std.mem.startsWith(u8, data, "GET /api/v1/health")) {
+        defer conn.stream.close();
         const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
         _ = conn.stream.writeAll(resp) catch {};
         return;
     } else if (std.mem.startsWith(u8, data, "GET / HTTP/1.1") or std.mem.startsWith(u8, data, "GET /index.html")) {
+        defer conn.stream.close();
         const html = embedded_ui.index_html;
         var header_buf: [256]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{html.len}) catch return;
@@ -92,6 +128,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         _ = conn.stream.writeAll(html) catch {};
         return;
     } else if (std.mem.startsWith(u8, data, "GET /assets/index.js")) {
+        defer conn.stream.close();
         const js = embedded_ui.index_js;
         var header_buf: [256]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n", .{js.len}) catch return;
@@ -100,33 +137,39 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         return;
     } else if (std.mem.indexOf(u8, data, "Upgrade: websocket") != null or std.mem.startsWith(u8, data, "GET /api/v2/stream")) {
         const resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
-        conn.stream.writeAll(resp) catch return;
+        conn.stream.writeAll(resp) catch {
+            conn.stream.close();
+            return;
+        };
         std.log.info("WebSocket tunnel established with {any}", .{conn.address});
 
-        var write_mutex = std.Thread.Mutex{};
-        var sessions_mutex = std.Thread.Mutex{};
-        var parser = protocol.FrameParser.init();
-        var sessions = std.AutoHashMap(u32, *UpstreamSession).init(allocator);
+        const ctx = ConnectionContext.create(allocator, conn.stream) catch {
+            conn.stream.close();
+            return;
+        };
         defer {
-            sessions_mutex.lock();
-            var it = sessions.iterator();
+            ctx.active.store(false, .seq_cst);
+            ctx.sessions_mutex.lock();
+            var it = ctx.sessions.iterator();
             while (it.next()) |entry| {
                 entry.value_ptr.*.active.store(false, .seq_cst);
                 entry.value_ptr.*.release(allocator);
             }
-            sessions.deinit();
-            sessions_mutex.unlock();
+            ctx.sessions_mutex.unlock();
+            ctx.release();
         }
 
-        while (true) {
+        var parser = protocol.FrameParser.init();
+
+        while (ctx.active.load(.seq_cst)) {
             const dest = parser.getWriteSlice();
-            const n = conn.stream.read(dest) catch break;
+            const n = ctx.conn_stream.read(dest) catch break;
             if (n == 0) break;
             parser.advance(n);
 
             while (parser.next()) |frame| {
                 if (frame.header.frame_type == .ping) {
-                    writeTunnelFrame(conn.stream, &write_mutex, 0, .pong, 0, &.{}) catch break;
+                    ctx.writeFrame(0, .pong, 0, &.{}) catch break;
                 } else if (frame.header.frame_type == .connect) {
                     if (frame.payload.len >= 4 and frame.payload[0] == 0x02) {
                         const domain_len = frame.payload[1];
@@ -138,7 +181,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
 
                             const target_stream = std.net.tcpConnectToHost(allocator, domain, port) catch |err| {
                                 std.log.err("[Hub] Connection to upstream {s}:{d} failed: {any}", .{ domain, port, err });
-                                writeTunnelFrame(conn.stream, &write_mutex, frame.header.stream_id, .close, protocol.Flags.RST, &.{}) catch {};
+                                ctx.writeFrame(frame.header.stream_id, .close, protocol.Flags.RST, &.{}) catch {};
                                 continue;
                             };
 
@@ -157,24 +200,24 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                             };
                             @memcpy(session.target_host[0..domain.len], domain);
 
-                            sessions_mutex.lock();
-                            sessions.put(frame.header.stream_id, session) catch {
-                                sessions_mutex.unlock();
+                            ctx.sessions_mutex.lock();
+                            ctx.sessions.put(frame.header.stream_id, session) catch {
+                                ctx.sessions_mutex.unlock();
                                 target_stream.close();
                                 allocator.destroy(session);
                                 continue;
                             };
-                            sessions_mutex.unlock();
+                            ctx.sessions_mutex.unlock();
 
+                            ctx.acquire();
                             const reader_thread = std.Thread.spawn(.{}, pumpUpstreamToTunnel, .{
-                                allocator,
+                                ctx,
                                 session,
-                                conn.stream,
-                                &write_mutex,
                             }) catch {
-                                sessions_mutex.lock();
-                                _ = sessions.remove(frame.header.stream_id);
-                                sessions_mutex.unlock();
+                                ctx.release();
+                                ctx.sessions_mutex.lock();
+                                _ = ctx.sessions.remove(frame.header.stream_id);
+                                ctx.sessions_mutex.unlock();
                                 session.release(allocator);
                                 session.release(allocator);
                                 continue;
@@ -183,9 +226,9 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                         }
                     }
                 } else if (frame.header.frame_type == .data) {
-                    sessions_mutex.lock();
-                    const maybe_session = sessions.get(frame.header.stream_id);
-                    sessions_mutex.unlock();
+                    ctx.sessions_mutex.lock();
+                    const maybe_session = ctx.sessions.get(frame.header.stream_id);
+                    ctx.sessions_mutex.unlock();
 
                     if (maybe_session) |session| {
                         session.target_stream.writeAll(frame.payload) catch {
@@ -194,9 +237,9 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                         std.log.info("[Hub] Wrote {d} bytes from tunnel to upstream {s}:{d} (stream {d})", .{ frame.payload.len, session.getHost(), session.target_port, frame.header.stream_id });
                     }
                 } else if (frame.header.frame_type == .close) {
-                    sessions_mutex.lock();
-                    const maybe_session = sessions.fetchRemove(frame.header.stream_id);
-                    sessions_mutex.unlock();
+                    ctx.sessions_mutex.lock();
+                    const maybe_session = ctx.sessions.fetchRemove(frame.header.stream_id);
+                    ctx.sessions_mutex.unlock();
 
                     if (maybe_session) |kv| {
                         kv.value.active.store(false, .seq_cst);
@@ -205,6 +248,8 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                 }
             }
         }
+    } else {
+        conn.stream.close();
     }
 }
 
